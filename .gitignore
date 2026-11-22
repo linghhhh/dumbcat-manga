@@ -1,0 +1,47 @@
+# ---- 签名与密钥：绝不入库 ----
+# 泄露 release keystore 等于把包名交给任何人（可冒充更新、覆盖安装）
+*.jks
+*.keystore
+*.p12
+*.pem
+
+# ---- 本机配置 ----
+# local.properties 里有 SDK 路径和签名口令，每台机器一份
+local.properties
+local.properties.*
+
+# ---- 构建产物 ----
+build/
+.gradle/
+*.apk
+*.aab
+*.ap_
+dist/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# ---- 图标源图 ----
+# tools/icon_src.jpg 是私有素材（自己拍的实物照片），不随仓库发布。
+# 生成好的图标已经提交在 res/mipmap-* 里；要重新生成请自备同名图片。
+tools/icon_src.jpg
+
+# ---- 临时文件 / 草稿 ----
+tmp/
+.scratch/
+*.log
+*.tmp
+
+# ---- 编辑器 / 系统 ----
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+nul

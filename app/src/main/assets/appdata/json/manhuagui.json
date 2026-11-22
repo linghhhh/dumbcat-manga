@@ -1,0 +1,17 @@
+{
+  "key": "manhuagui",
+  "name": "漫画柜",
+  "engine": "python",
+  "module": "dumbcat.sources.providers",
+  "class": "BrowserSiteProvider",
+  "icon": "🗄",
+  "nsfw": false,
+  "enabled": false,
+  "breeze": true,
+  "note": "浏览器型站点：章节页有 JS 校验，取图走内置浏览器。",
+  "args": [
+    "manhuagui",
+    "漫画柜",
+    "https://tw.manhuagui.com"
+  ]
+}

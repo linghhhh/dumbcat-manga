@@ -1,0 +1,12 @@
+{
+  "key": "jjmhw",
+  "name": "JJ漫画",
+  "engine": "python",
+  "module": "dumbcat.sources.sites.jjmhw",
+  "class": "JjmhwProvider",
+  "icon": "🎭",
+  "nsfw": true,
+  "enabled": false,
+  "breeze": false,
+  "note": "HTML 解析，列表页有广告位，取图时走详情页。"
+}

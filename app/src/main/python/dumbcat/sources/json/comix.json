@@ -1,0 +1,12 @@
+{
+  "key": "comix",
+  "name": "Comix",
+  "engine": "python",
+  "module": "dumbcat.sources.providers",
+  "class": "ComixProvider",
+  "icon": "📚",
+  "nsfw": false,
+  "enabled": false,
+  "breeze": false,
+  "note": "服务端渲染列表 + 详情页取章节；首次打开较慢，之后就吃缓存。"
+}

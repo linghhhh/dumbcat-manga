@@ -1,0 +1,12 @@
+{
+  "key": "qimanga",
+  "name": "QiManga",
+  "engine": "python",
+  "module": "dumbcat.sources.providers",
+  "class": "QiMangaProvider",
+  "icon": "🍥",
+  "nsfw": false,
+  "enabled": false,
+  "breeze": false,
+  "note": "韩漫站点，走官方 JSON 接口（/series、/search），封面直链。"
+}

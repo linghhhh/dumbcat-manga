@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>呆猫漫画</title>
+  <link rel="icon" href="/static/assets/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/css/base.css" />
+  <link rel="stylesheet" href="/static/css/components.css" />
+</head>
+<body data-theme="cream">
+  <!-- 启动页：呆猫和 doro 一起看书，加载完淡出 -->
+  <div id="boot" class="boot">
+    <img class="boot-art" src="/static/assets/loading.webp" alt="呆猫和 doro 一起看书" draggable="false" />
+    <p class="boot-title">呆猫漫画</p>
+    <p class="boot-sub" id="bootTip">正在准备书架…</p>
+    <div class="boot-bar" aria-hidden="true"><i></i></div>
+  </div>
+
+  <div class="app-shell" id="app" hidden>
+    <!-- 左侧栏 -->
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#/browse" title="回到发现">
+        <span class="brand-mark" aria-hidden="true">呆</span>
+        <span class="brand-text">
+          <strong>呆猫漫画</strong>
+          <small>DumbCat Manga</small>
+        </span>
+      </a>
+
+      <div class="source-block">
+        <div class="source-head">
+          <span>图源</span>
+          <button class="icon-btn" id="reloadSources" title="重新加载图源">⟳</button>
+        </div>
+        <div class="source-list" id="sourceList" role="list">
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+          <div class="skeleton-line"></div>
+        </div>
+      </div>
+
+      <div class="sidebar-foot">
+        <span class="version">v__DUMBCAT_VERSION__</span>
+      </div>
+    </aside>
+
+    <!-- 主区 -->
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-btn only-mobile" id="openSidebar" aria-label="菜单">☰</button>
+        <button class="back-btn" id="backBtn" title="返回上一页（Alt+← 或 退格）" disabled><b>←</b><span>返回</span></button>
+        <form class="global-search" id="globalSearch" role="search">
+          <span class="gs-ico" aria-hidden="true">🔍</span>
+          <input id="searchInput" type="search" placeholder="全局搜索：作品名 / 作者 / 标签…" autocomplete="off" spellcheck="false" />
+          <kbd>Ctrl K</kbd>
+          <button type="submit" class="search-go">搜索</button>
+        </form>
+        <div class="top-actions">
+          <button class="icon-btn" id="openShelf" title="书架">📚</button>
+        </div>
+      </header>
+
+      <section class="view" id="view"></section>
+    </main>
+
+    <!-- 手机底部导航：只在窄屏出现，替代网页式返回与顶栏图标 -->
+    <nav class="tabbar" id="tabBar" aria-label="主导航">
+      <a class="tab-item" href="#/browse" data-tab="browse"><i aria-hidden="true">🧺</i><span>发现</span></a>
+      <a class="tab-item" href="#/search" data-tab="search"><i aria-hidden="true">🔍</i><span>搜索</span></a>
+      <a class="tab-item" href="#/shelf" data-tab="shelf"><i aria-hidden="true">📚</i><span>书架</span></a>
+      <a class="tab-item" href="#/mine" data-tab="mine"><i aria-hidden="true">🐱</i><span>我的</span></a>
+    </nav>
+  </div>
+
+  <div class="drawer-mask" id="drawerMask" hidden></div>
+
+  <!-- 弹层 -->
+  <div class="modal-root" id="modalRoot" hidden>
+    <div class="modal-mask" data-close="1"></div>
+    <div class="modal" role="dialog" aria-modal="true" id="modalBody"></div>
+  </div>
+
+  <div class="toast-root" id="toastRoot" aria-live="polite"></div>
+
+  <script>
+    window.__DUMBCAT__ = { token: "__DUMBCAT_TOKEN__", version: "__DUMBCAT_VERSION__" };
+  </script>
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

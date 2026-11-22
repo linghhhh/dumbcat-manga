@@ -1,0 +1,118 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+// ---------------------------------------------------------------------------
+// 本机配置读取：签名口令、Chaquopy 的 Python 路径都不写进仓库。
+// 优先读 local.properties（本机文件，已被 .gitignore 排除），其次读环境变量。
+// ---------------------------------------------------------------------------
+def localProps = new Properties()
+def localPropsFile = rootProject.file("local.properties")
+if (localPropsFile.exists()) {
+    localPropsFile.withInputStream { localProps.load(it) }
+}
+
+def configValue = { String key, String envName ->
+    def fromLocal = localProps.getProperty(key)
+    def fromEnv = System.getenv(envName)
+    def value = (fromLocal != null && !fromLocal.trim().isEmpty()) ? fromLocal : fromEnv
+    return (value == null || value.trim().isEmpty()) ? null : value.trim()
+}
+
+// signing：没有 keystore 也能构建（产出 unsigned APK），只是不能分发
+def keystorePath = configValue("dumbcat.keystore", "DUMBCAT_KEYSTORE")
+def keystoreFile = null
+if (keystorePath != null) {
+    def candidate = new File(keystorePath)
+    keystoreFile = candidate.isAbsolute() ? candidate : file(keystorePath)
+    if (!keystoreFile.exists()) {
+        logger.warn("[dumbcat] 找不到 keystore：${keystoreFile}，release 包将不签名")
+        keystoreFile = null
+    }
+}
+def hasSigning = keystoreFile != null
+
+android {
+    namespace 'com.dumbcat.manga'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.dumbcat.manga"
+        minSdk 24
+        targetSdk 35
+        // 对外的首个公开版本用 0.1.0（见 README「版本说明」）。
+        // versionCode 必须继续递增：内部 3.2.x 的 versionCode 是 5，
+        // 退回 1 会让已安装的老用户无法升级安装。
+        versionCode 6
+        versionName "0.1.0"
+
+        ndk {
+            // 64 位真机 + 老 32 位设备 + 模拟器
+            abiFilters "arm64-v8a", "x86_64"
+        }
+    }
+
+    signingConfigs {
+        if (hasSigning) {
+            release {
+                storeFile keystoreFile
+                storePassword configValue("dumbcat.storePassword", "DUMBCAT_STORE_PASSWORD")
+                keyAlias configValue("dumbcat.keyAlias", "DUMBCAT_KEY_ALIAS")
+                keyPassword configValue("dumbcat.keyPassword", "DUMBCAT_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            signingConfig hasSigning ? signingConfigs.release : null
+        }
+        debug {
+            applicationIdSuffix ".debug"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version = "3.10"
+        // 默认从 PATH 找 Python 3.10；本机要指定就在 local.properties 里写
+        //   chaquopy.python=D:/Python310/python.exe
+        def chaquopyPython = configValue("chaquopy.python", "CHAQUOPY_PYTHON")
+        if (chaquopyPython != null) {
+            buildPython(chaquopyPython)
+        }
+        pip {
+            // PyPI 偶尔 TLS 抖动，多给几次重试
+            options("--retries", "8")
+            options("--timeout", "60")
+            install("fastapi==0.94.0")
+            install("pydantic==1.10.26")
+            install("uvicorn==0.23.2")
+            // h11 0.16 与 uvicorn<0.30 不兼容（keep-alive 时报 LocalProtocolError）
+            install("h11==0.14.0")
+            install("cryptography==3.4.8")
+            install("pillow==9.2.0")
+        }
+    }
+}
+
+dependencies {
+}

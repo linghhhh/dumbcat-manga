@@ -1,0 +1,12 @@
+{
+  "key": "webtoon",
+  "name": "WEBTOON",
+  "engine": "python",
+  "module": "dumbcat.sources.sites.webtoon",
+  "class": "WebtoonProvider",
+  "icon": "🟢",
+  "nsfw": false,
+  "enabled": false,
+  "breeze": false,
+  "note": "官方站点分区域；纯 HTTP（HMAC 签名 + 网页版列表），不需要浏览器。"
+}

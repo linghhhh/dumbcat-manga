@@ -1,0 +1,12 @@
+{
+  "key": "comix",
+  "name": "Comix",
+  "engine": "python",
+  "module": "dumbcat.sources.providers",
+  "class": "ComixProvider",
+  "icon": "📚",
+  "nsfw": false,
+  "enabled": false,
+  "breeze": true,
+  "note": "需要 Chromium 渲染；手机版默认不启用。"
+}

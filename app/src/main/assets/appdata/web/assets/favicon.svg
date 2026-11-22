@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- 呆猫头像：蓝帽兜 + 米白圆脸 + 粗黑描边（与启动插画、界面配色一致） -->
+  <rect width="64" height="64" rx="15" fill="#2F6BFF"/>
+  <path d="M9 44V17.6c0-2.3 2.4-3.5 4.2-2.2l7.6 5.4h22.4l7.6-5.4c1.8-1.3 4.2-.1 4.2 2.2V44c0 9.8-7.6 14.4-23 14.4S9 53.8 9 44z"
+        fill="#4C86FF" stroke="#0E1B33" stroke-width="3.6" stroke-linejoin="round"/>
+  <ellipse cx="32" cy="41" rx="16.5" ry="13.6" fill="#FCECCB" stroke="#0E1B33" stroke-width="2.8"/>
+  <ellipse cx="32" cy="45" rx="10.4" ry="6.6" fill="#F6E3BE"/>
+  <circle cx="25.4" cy="39" r="5.2" fill="#FFFFFF" stroke="#0E1B33" stroke-width="2.3"/>
+  <circle cx="38.6" cy="39" r="5.2" fill="#FFFFFF" stroke="#0E1B33" stroke-width="2.3"/>
+  <circle cx="26.1" cy="38.3" r="3.3" fill="#101820"/>
+  <circle cx="39.3" cy="38.3" r="3.3" fill="#101820"/>
+  <path d="M27.6 44.6q2.2 3.6 4.4.3 2.2 3.3 4.4-.3" fill="none" stroke="#101820" stroke-width="2.3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

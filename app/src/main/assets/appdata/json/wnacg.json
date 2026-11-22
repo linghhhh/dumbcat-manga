@@ -1,0 +1,12 @@
+{
+  "key": "wnacg",
+  "name": "绅士漫画",
+  "engine": "python",
+  "module": "dumbcat.sources.sites.wnacg",
+  "class": "WnacgProvider",
+  "icon": "🧸",
+  "nsfw": true,
+  "enabled": false,
+  "breeze": false,
+  "note": "纯 HTTP（列表/搜索/章节都是服务端渲染），另有 zip 整本下载。"
+}

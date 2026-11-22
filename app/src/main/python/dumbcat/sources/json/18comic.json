@@ -1,0 +1,12 @@
+{
+  "key": "18comic",
+  "name": "禁漫天堂",
+  "engine": "python",
+  "module": "dumbcat.sources.providers",
+  "class": "JmProvider",
+  "icon": "🔐",
+  "nsfw": true,
+  "enabled": false,
+  "breeze": false,
+  "note": "官方 JSON 接口；会员章节要在「图源登录」里用账号密码登录。"
+}

@@ -1,0 +1,12 @@
+{
+  "key": "manga18fx",
+  "name": "Manga18fx",
+  "engine": "python",
+  "module": "dumbcat.sources.providers",
+  "class": "Manga18fxProvider",
+  "icon": "🔞",
+  "nsfw": true,
+  "enabled": false,
+  "breeze": false,
+  "note": "18+ 站点，HTML 解析，章节分页较多。"
+}

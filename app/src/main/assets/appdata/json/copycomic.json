@@ -1,0 +1,12 @@
+{
+  "key": "copycomic",
+  "name": "拷贝漫画",
+  "engine": "python",
+  "module": "dumbcat.sources.providers",
+  "class": "CopyComicProvider",
+  "icon": "📋",
+  "nsfw": false,
+  "enabled": false,
+  "breeze": false,
+  "note": "JSON 接口，部分网络环境连不上；连不上时侧栏会标红。"
+}
