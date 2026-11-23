@@ -150,6 +150,12 @@ class SourceAdapter:
         return str(self.info.base_url or "")
 
     def login_hint(self) -> str:
+        from dumbcat import login_bridge
+
+        if login_bridge.available():
+            return ("点「打开登录页」会弹出应用内的登录窗口，用官方账号登录（验证码、"
+                    "二次验证都行）；登好后关掉窗口，再点「我已登录」，程序只保存结果 "
+                    "Cookie 供后续请求复用。")
         return ("在程序打开的站点页面里用官方账号登录（验证码、二次验证都行），"
                 "登录完成后点「完成登录」，程序只保存结果 Cookie 供后续请求复用。")
 
@@ -178,19 +184,31 @@ class SourceAdapter:
         url = self.login_url()
         if not url:
             raise SourceError(f"{self.name} 没有可登录的站点地址")
+        from dumbcat import login_bridge
+
+        # 手机上没有 Chromium：用应用内的 WebView 打开登录页
+        if login_bridge.available():
+            login_bridge.open_window(url)
+            return url
         from dumbcat.browser.hub import hub
 
         hub().ensure_visible(True)
         return hub().show_window(url)
 
     def capture_login(self) -> int:
-        """把共享浏览器里该站点的 Cookie 收进会话（用户点「完成登录」时调用）。"""
+        """把登录窗口里该站点的 Cookie 收进会话（用户点「完成登录」时调用）。"""
         url = self.login_url()
         if not url:
             raise SourceError(f"{self.name} 没有可登录的站点地址")
-        from dumbcat.browser.hub import hub
+        from dumbcat import login_bridge
 
-        items = hub().cookies_for(url)
+        items = None
+        if login_bridge.available():
+            items = login_bridge.read_cookies(url, str(self.info.base_url or ""))
+        if items is None:
+            from dumbcat.browser.hub import hub
+
+            items = hub().cookies_for(url)
         session = self._session()
         count = session.absorb_browser_cookies(items)
         if count:
@@ -724,6 +742,8 @@ class Registry:
                     and child.name != "plugin.json"
                 ):
                     candidates.append(child)
+                elif child.is_file() and child.suffix == ".js":
+                    candidates.append(child)
                 elif child.is_dir() and (child / "plugin.json").exists():
                     candidates.append(child)
             # 内置示例目录允许直接放 main.py 的文件夹
@@ -819,7 +839,90 @@ class Registry:
             path=path,
         )
 
+    def _load_js_source(self, path: Path, seen: set[str]) -> LoadedPlugin:
+        """把一个 .js 文件塞进内嵌 QuickJS，变成一个图源（见 js_source.py）。"""
+        from dumbcat.plugins import js_bridge
+        from dumbcat.plugins.js_source import JsSourcePlugin
+
+        fallback_key = re.sub(r"[^a-z0-9_]", "_", path.stem.lower()) or "broken"
+        if not PLUGIN_KEY_RE.match(fallback_key):
+            fallback_key = "p_" + hashlib.sha1(fallback_key.encode()).hexdigest()[:8]
+        try:
+            script = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            detail = f"读文件失败：{exc}"
+            return LoadedPlugin(
+                info=SourceInfo(key=fallback_key, name=path.stem, kind="plugin",
+                                origin=str(path), error=detail),
+                adapter=None, path=path, error=detail,
+            )
+        try:
+            meta = js_bridge.load(fallback_key, script)
+        except js_bridge.JsError as exc:
+            detail = str(exc)
+            return LoadedPlugin(
+                info=SourceInfo(key=fallback_key, name=path.stem, kind="plugin",
+                                origin=str(path), error=detail),
+                adapter=None, path=path, error=detail,
+            )
+        declared = str((meta or {}).get("key") or "").strip().lower()
+        key = declared if PLUGIN_KEY_RE.match(declared) else fallback_key
+        name = str((meta or {}).get("name") or path.stem)
+        if key in seen or key in self._builtin_providers:
+            key = f"{key}_{hashlib.sha1(str(path).encode()).hexdigest()[:4]}"
+        seen.add(key)
+        attrs = {
+            "SCRIPT": script,
+            "SCRIPT_PATH": str(path),
+            "META": dict(meta or {}),
+            "key": key,
+            "name": name,
+            "base_url": str((meta or {}).get("baseUrl") or ""),
+            "version": str((meta or {}).get("version") or "1.0.0"),
+            "icon": str((meta or {}).get("icon") or "🧩"),
+            "nsfw": bool((meta or {}).get("nsfw")),
+            "page_size": int((meta or {}).get("pageSize") or 30),
+            "author": "",
+            "description": "JS 图源",
+        }
+        try:
+            cls = type(f"JsSource_{key}", (JsSourcePlugin,), attrs)
+            ctx = PluginContext(
+                key,
+                plugin_dir=path.parent,
+                cache_dir=PLUGIN_CACHE_DIR / key,
+                logger=logging.getLogger(f"dumbcat.plugin.{key}"),
+            )
+            instance = cls(ctx)
+        except Exception as exc:  # noqa: BLE001
+            detail = f"JS 图源初始化失败：{type(exc).__name__}: {exc}"
+            return LoadedPlugin(
+                info=SourceInfo(key=key, name=name, kind="plugin", origin=str(path), error=detail),
+                adapter=None, path=path, error=detail,
+            )
+        info = SourceInfo(
+            key=key,
+            name=name,
+            kind="plugin",
+            version=attrs["version"],
+            author="",
+            description=attrs["description"],
+            icon=attrs["icon"],
+            nsfw=attrs["nsfw"],
+            base_url=attrs["base_url"],
+            origin=str(path),
+        )
+        module = types.SimpleNamespace(__file__=str(path), __name__=f"dumbcat_js_source_{key}")
+        return LoadedPlugin(
+            info=info,
+            adapter=PluginAdapter(instance, info, module),
+            module=module,
+            path=path,
+        )
+
     def _load_one(self, path: Path, seen: set[str]) -> LoadedPlugin | None:
+        if path.is_file() and path.suffix.lower() == ".js":
+            return self._load_js_source(path, seen)
         if path.is_file() and path.suffix.lower() == ".json":
             _key, enabled = self._json_enabled(path, load_enabled_overlay())
             if not enabled:
@@ -1091,7 +1194,8 @@ class Registry:
             relative = relative.replace("\\", "/").strip("/")
             if not relative or ".." in relative.split("/"):
                 continue
-            if not (relative.endswith(".py") or relative.endswith(".json")
+            if not (relative.endswith(".py") or relative.endswith(".js")
+                    or relative.endswith(".json")
                     or relative.endswith(".md") or relative.endswith(".txt")
                     or relative.endswith(".png") or relative.endswith(".svg")):
                 continue
@@ -1104,8 +1208,8 @@ class Registry:
             with archive.open(name) as source, open(destination, "wb") as sink:
                 shutil.copyfileobj(source, sink)
             installed.append(relative)
-        if not any(item.endswith(".py") for item in installed):
-            raise SourceError("压缩包里没有 .py 插件文件")
+        if not any(item.endswith((".py", ".js")) for item in installed):
+            raise SourceError("压缩包里没有 .py 插件或 .js 脚本图源")
         self.reload_plugins()
         return {"installed": installed, "count": len(installed)}
 
@@ -1126,8 +1230,8 @@ class Registry:
             raise SourceError("只能编辑用户插件目录里的文件")
         if not local.is_file():
             raise SourceError("文件不存在")
-        if local.suffix.lower() not in {".py", ".json"}:
-            raise SourceError("只能编辑 .py / .json 图源文件")
+        if local.suffix.lower() not in {".py", ".json", ".js"}:
+            raise SourceError("只能编辑 .py / .json / .js 图源文件")
         if local.stat().st_size > 1024 * 1024:
             raise SourceError("源码超过 1MB")
         try:
@@ -1143,12 +1247,17 @@ class Registry:
     def save_plugin_file(self, filename: str, content: str) -> dict[str, Any]:
         name = Path(filename).name
         suffix = Path(name).suffix.lower()
-        if suffix not in {".py", ".json"} or name.startswith("."):
-            raise SourceError("只接受 .py 插件或 .json 图源文件")
+        if suffix not in {".py", ".json", ".js"} or name.startswith("."):
+            raise SourceError("只接受 .py 插件、.json 规则图源或 .js 脚本图源")
         if name == "plugin.json":
             raise SourceError("plugin.json 是插件目录清单，请直接编辑插件目录")
         if len(content.encode("utf-8")) > 1024 * 1024:
             raise SourceError("文件超过 1MB")
+        if suffix == ".js":
+            if "registerSource(" not in content:
+                raise SourceError('JS 图源必须调用 registerSource({...})，写法见「新建图源」里的模板')
+            if not re.search(r"key\s*:\s*['\"][a-z][a-z0-9_]{1,31}['\"]", content):
+                raise SourceError("JS 图源里没有合法的 key（小写字母开头，2-32 位）")
         if suffix == ".json":
             from dumbcat.plugins.json_source import config_errors
 
@@ -1278,3 +1387,98 @@ class MySource(SourcePlugin):
 
 PLUGIN = MySource
 '''
+
+
+def js_plugin_template(name: str = "my_js_source", display: str = "我的 JS 图源",
+                       base_url: str = "https://example.com") -> str:
+    """生成一个 JS 脚本图源的模板（需要安卓版里的内嵌 QuickJS 才能跑）。"""
+    key = re.sub(r"[^a-z0-9_]", "_", name.strip().lower()) or "my_js_source"
+    if not PLUGIN_KEY_RE.match(key):
+        key = "my_js_source"
+    template = '''// 呆猫漫画 · JS 脚本图源
+//
+// 保存成 <key>.js 放进「用户插件」目录（或在图源管理里导入 .js），热重载后生效。
+// 环境是内嵌的 QuickJS：只有 ES2020，没有 window / document / fetch，
+// 网络请用 Network.*，解析 HTML 请用 Html.parse()，加密请用 Crypto.*。
+// 所有函数都必须是**同步**函数，返回值必须是普通对象（不能是 Promise / DOM 节点）。
+
+registerSource({
+  key: "__KEY__",
+  name: "__DISPLAY__",
+  baseUrl: "__BASE__",
+  version: "0.1.0",
+  icon: "🐾",
+  nsfw: false,
+  pageSize: 20,
+
+  // 首页/列表：category 是站点的分类标识，page 从 1 开始
+  browse: function (payload) {
+    var url = payload.baseUrl + "/list/" + (payload.category || "all") + "?page=" + payload.page;
+    var doc = Html.parse(Network.get(url, { Referer: payload.baseUrl }));
+    var items = doc.findAll(".comic-item").map(function (node) {
+      return {
+        title: node.getText(".title") || node.get("a@title") || node.get("a"),
+        url: Tools.absUrl(payload.baseUrl, node.get("a@href")),
+        poster: Tools.absUrl(payload.baseUrl, node.get("img@data-src") || node.get("img@src")),
+      };
+    });
+    return { items: items, hasMore: items.length >= 20 };
+  },
+
+  // 搜索：query 是用户输入的关键词
+  search: function (payload) {
+    var url = payload.baseUrl + "/search?q=" + encodeURIComponent(payload.query);
+    var doc = Html.parse(Network.get(url, { Referer: payload.baseUrl }));
+    var items = doc.findAll(".comic-item").map(function (node) {
+      return {
+        title: node.getText(".title") || node.get("a"),
+        url: Tools.absUrl(payload.baseUrl, node.get("a@href")),
+        poster: Tools.absUrl(payload.baseUrl, node.get("img@data-src") || node.get("img@src")),
+      };
+    });
+    return { items: items, hasMore: false };
+  },
+
+  // 详情：可以返回 undefined，那就只用列表里已有的信息
+  detail: function (payload) {
+    var doc = Html.parse(Network.get(payload.url, { Referer: payload.baseUrl }));
+    return {
+      author: doc.getText(".author"),
+      summary: doc.getText(".intro"),
+      status: doc.getText(".status"),
+      tags: doc.findAll(".tags a").map(function (node) { return node.text(); }),
+    };
+  },
+
+  // 章节列表：按顺序返回
+  chapters: function (payload) {
+    var doc = Html.parse(Network.get(payload.url, { Referer: payload.baseUrl }));
+    return doc.findAll(".chapter-list a").map(function (node, index) {
+      return {
+        title: node.text(),
+        url: Tools.absUrl(payload.baseUrl, node.attr("href")),
+        number: index + 1,
+      };
+    });
+  },
+
+  // 图片列表：返回 { urls: [...], referer: "..." }
+  pages: function (payload) {
+    var url = payload.chapterUrl || payload.url;
+    var doc = Html.parse(Network.get(url, { Referer: payload.baseUrl }));
+    var urls = doc.findAll(".comic-page img").map(function (node) {
+      return Tools.absUrl(payload.baseUrl, node.attr("data-src") || node.attr("src"));
+    });
+    return { urls: urls, referer: url };
+  },
+
+  // 需要自己处理 Referer / Cookie / 解密时实现它；不实现就走默认下载
+  // payload 里有 url / referer / baseUrl
+  // fetchImage: function (payload) {
+  //   return Network.getBase64(payload.url, { Referer: payload.referer || payload.baseUrl });
+  // },
+});
+'''
+    return (template.replace("__KEY__", key)
+            .replace("__DISPLAY__", display)
+            .replace("__BASE__", base_url))

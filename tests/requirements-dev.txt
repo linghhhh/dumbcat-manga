@@ -1,0 +1,4 @@
+# 开发期依赖：CI 和本机跑测试都用这一份
+# pip install -r tests/requirements-dev.txt
+pytest>=8,<10
+httpx>=0.24,<0.29

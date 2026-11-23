@@ -52,6 +52,7 @@ export async function render(root, params, ctx = {}) {
     allSelected: false,
     pickMode: false,
     saved: false,
+    offline: Boolean(data.offline),
   };
 
   draw();
@@ -75,6 +76,10 @@ function draw() {
 
   root.append(
     bannerEl(),
+    state.offline ? el('div', {
+      class: 'hint',
+      style: 'padding:10px 16px;color:var(--warn);text-align:center',
+    }, '离线模式：图源暂时连不上，这里显示的是书架里的快照；看过的章节和已下载的图仍然能打开。') : null,
     chipsEl(),
     introEl(),
     likeSection(),
@@ -208,7 +213,17 @@ function actionBar() {
   return el('div', { class: 'dtl-actionbar' },
     el('button', {
       class: 'btn ghost', id: 'barDownloadBtn', type: 'button',
-      on: { click: () => togglePickMode() },
+      on: {
+        click: () => {
+          // 已展开勾选且选了章节 → 直接发起下载；否则进入 / 退出勾选模式
+          if (state.pickMode) {
+            if (state.selected.size) openDownloadForSelection();
+            else toast('先勾选要下载的章节吧', { type: 'info' });
+          } else {
+            togglePickMode(true);
+          }
+        },
+      },
     }, '📥 下载'),
     shelfBtn,
     el('button', {
@@ -239,7 +254,23 @@ function paintShelfBtn() {
 
 async function shelfAction() {
   if (!state) return;
-  const res = await openShelfPicker(state.series);
+  const res = await openShelfPicker(state.series, {
+    chapters: state.chapters.map((chapter) => ({
+      uid: chapter.uid,
+      title: chapter.title || '',
+      number: chapter.number ?? null,
+      index: chapter.index ?? 0,
+      locked: Boolean(chapter.locked),
+    })),
+    summary: {
+      description: state.series.description || '',
+      status: state.series.status || '',
+      tags: state.series.tags || [],
+      url: state.series.url || '',
+      nsfw: Boolean(state.series.nsfw),
+      providerName: state.series.providerName || '',
+    },
+  });
   if (res) await refreshShelfState();
 }
 
@@ -568,6 +599,14 @@ function openDownloadForSelection() {
     selectedUids: Array.from(state.selected),
     defaultDir: settings.output_dir || '',
     workers: settings.workers || 4,
+    // 整本书的章节都带上：后端据此冻结下载快照，重开 App 也能续下
+    chapterSnapshot: state.chapters.map((chapter) => ({
+      uid: chapter.uid,
+      title: chapter.title || '',
+      number: chapter.number ?? null,
+      index: chapter.index ?? 0,
+      locked: Boolean(chapter.locked),
+    })),
   });
 }
 

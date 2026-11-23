@@ -19,7 +19,7 @@ import time
 from concurrent.futures import Future
 import urllib.parse
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
@@ -33,6 +33,15 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from dumbcat.app_config import IMAGE_EXTENSIONS
+from dumbcat import android_storage
+from dumbcat.download_paths import (
+    DownloadPathError,
+    in_public_storage,
+    probe_writable,
+    resolve_output_dir,
+)
+from dumbcat.naming import sanitize_path_component
 from dumbcat.server.config import (
     PROJECT_ROOT,
     WEB_RUNTIME,
@@ -55,6 +64,7 @@ from dumbcat.server.registry import (
     SourceError,
     health_snapshot,
     note_health,
+    js_plugin_template,
     plugin_template,
     registry,
 )
@@ -81,6 +91,9 @@ class DownloadRequest(BaseModel):
     chapterUids: list[str]
     outputDir: str = ""
     workers: int | None = None
+    #: 提交时的作品/章节快照：内存仓库被淘汰或进程重启后仍能继续下载
+    series: dict[str, Any] = {}
+    chapters: list[dict[str, Any]] = []
 
 
 class SettingsPatch(BaseModel):
@@ -92,6 +105,8 @@ class SettingsPatch(BaseModel):
     theme: str | None = None
     reduce_motion: bool | None = None
     grid_min_width: int | None = None
+    reader_gap: int | None = None
+    history_limit: int | None = None
     auto_load_more: bool | None = None
     chapter_newest_first: bool | None = None
     include_browser_sources: bool | None = None
@@ -112,6 +127,12 @@ class SourceToggle(BaseModel):
 
 class PathRequest(BaseModel):
     path: str
+
+
+class OptionalPathRequest(BaseModel):
+    """路径可选：不带 path（或整个 body 为空）时使用推荐默认目录。"""
+
+    path: Optional[str] = ""
 
 
 class LoginPassword(BaseModel):
@@ -247,8 +268,9 @@ async def get_settings() -> dict[str, Any]:
     data["pluginDir"] = str(registry.plugin_dir())
     data["cacheBytes"] = image_cache.size_bytes()
     data["version"] = VERSION
-    #: 手机版把下载根目录锁在应用私有目录，界面上只允许改子目录
+    #: 手机版下载目录可以由用户自己选（公共存储或应用私有目录）
     data["android"] = bool(os.getenv("DUMBCAT_ANDROID"))
+
     return data
 
 
@@ -714,9 +736,15 @@ async def search_stream(q: str = Query(...), sources: str = "") -> StreamingResp
 async def series_detail(uid: str) -> dict[str, Any]:
     record = store.get_series(uid)
     if record is None:
+        offline = await asyncio.to_thread(shelf_store.offline_detail, uid)
+        if offline is not None:
+            return offline
         raise HTTPException(404, "作品数据已过期，请重新搜索")
     adapter = registry.get(record.provider)
     if adapter is None:
+        offline = await asyncio.to_thread(shelf_store.offline_detail, uid)
+        if offline is not None:
+            return offline
         raise HTTPException(404, "图源不可用")
     raw = dict(record.raw)
     detail_at = time.time()
@@ -742,9 +770,17 @@ async def series_detail(uid: str) -> dict[str, Any]:
         chapters, raw_items = await _load_chapters(record, adapter)
     else:
         chapters, raw_items = cached.items, cached.raw_items
+    ordered = _order_chapters(chapters)
+    try:
+        # 顺手把书架里的离线快照刷新，下次断网打开就是最新的
+        await asyncio.to_thread(
+            shelf_store.refresh_all, record.uid, record.public, ordered, record.public
+        )
+    except Exception:  # noqa: BLE001 - 快照失败不影响详情页
+        log.debug("书架快照刷新失败：%s", record.uid)
     return {
         "series": record.public,
-        "chapters": _order_chapters(chapters),
+        "chapters": ordered,
         "cached": cached is not None,
     }
 
@@ -795,12 +831,27 @@ async def refresh_chapters(uid: str) -> dict[str, Any]:
 async def read_chapter(chapter_uid: str) -> dict[str, Any]:
     series_uid = series_of_chapter(chapter_uid)
     record = store.get_series(series_uid)
-    if record is None:
-        raise HTTPException(404, "作品数据已过期，请返回重新打开")
-    adapter = registry.get(record.provider)
-    if adapter is None:
-        raise HTTPException(404, "图源不可用")
     cached = store.get_pages(chapter_uid)
+    adapter = registry.get(record.provider) if record is not None else None
+    if record is None or adapter is None:
+        # 离线兜底：页列表已落盘 + 书架快照还在，就先把这一章读出来
+        if cached is not None:
+            offline = await asyncio.to_thread(shelf_store.offline_detail, series_uid)
+            if offline is not None:
+                chapter = next(
+                    (c for c in offline["chapters"] if c.get("uid") == chapter_uid), None
+                )
+                return {
+                    "chapterUid": chapter_uid,
+                    "series": offline["series"],
+                    "chapter": chapter or {"uid": chapter_uid, "title": ""},
+                    "pages": _public_pages(chapter_uid, cached.items),
+                    "cached": True,
+                    "offline": True,
+                }
+        if record is None:
+            raise HTTPException(404, "作品数据已过期，请返回重新打开")
+        raise HTTPException(404, "图源不可用")
     if cached is not None:
         # 命中缓存也要带上章节信息：阅读器靠它显示标题、上报浏览历史
         return {"chapterUid": chapter_uid, "series": record.public,
@@ -890,12 +941,20 @@ async def page_image(chapter_uid: str, index: int) -> Response:
     entry = store.get_pages(chapter_uid)
     series_uid = series_of_chapter(chapter_uid)
     record = store.get_series(series_uid)
-    if record is None:
-        raise HTTPException(404, "作品数据已过期")
-    adapter = registry.get(record.provider)
-    if adapter is None:
-        raise HTTPException(404, "图源不可用")
-    if entry is None:
+    adapter = registry.get(record.provider) if record is not None else None
+    if record is None or adapter is None or entry is None:
+        # 离线兜底：已下载到本地的图片直接读文件
+        local = await asyncio.to_thread(_local_page_file, series_uid, chapter_uid, index)
+        if local is not None:
+            try:
+                data = local.read_bytes()
+            except OSError as exc:
+                raise HTTPException(404, "本地图片读取失败") from exc
+            return _image_response(data, _mime_of(local), f"local:{local}")
+        if record is None:
+            raise HTTPException(404, "作品数据已过期")
+        if adapter is None:
+            raise HTTPException(404, "图源不可用")
         raise HTTPException(404, "章节图片未加载")
     page = next((item for item in entry.items if int(item.get("index", -1)) == index), None)
     if page is None:
@@ -904,9 +963,15 @@ async def page_image(chapter_uid: str, index: int) -> Response:
     referer = entry.referer or record.base_url
 
     def fetch() -> tuple[bytes, str]:
-        return image_cache.get_or_fetch(
-            remote, referer, lambda: adapter.fetch_image(remote, referer)
-        )
+        try:
+            return image_cache.get_or_fetch(
+                remote, referer, lambda: adapter.fetch_image(remote, referer)
+            )
+        except Exception:  # noqa: BLE001 - 网络挂了就退回本地已下载文件
+            local = _local_page_file(series_uid, chapter_uid, index)
+            if local is None:
+                raise
+            return local.read_bytes(), _mime_of(local)
 
     try:
         data, mime = await asyncio.to_thread(fetch)
@@ -916,6 +981,90 @@ async def page_image(chapter_uid: str, index: int) -> Response:
     return _image_response(data, mime, remote)
 
 
+def _mime_of(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in (".png",):
+        return "image/png"
+    if suffix in (".webp",):
+        return "image/webp"
+    if suffix in (".gif",):
+        return "image/gif"
+    if suffix in (".bmp",):
+        return "image/bmp"
+    return "image/jpeg"
+
+
+def _download_roots() -> list[Path]:
+    """可能的下载根目录：设置里的 + 最近下载任务实际用的（用户自选目录后也能找到图）。"""
+    roots: list[Path] = []
+
+    def add(raw: Any) -> None:
+        try:
+            path = Path(str(raw or "")).expanduser()
+        except (OSError, ValueError):
+            return
+        if str(path) and path not in roots:
+            roots.append(path)
+
+    add(load_settings().output_dir)
+    try:
+        for record in tasks.history(50):
+            add(record.get("outputDir"))
+    except Exception:  # noqa: BLE001 - 历史读不出来不影响看图
+        pass
+    return roots
+
+
+def _local_page_file(series_uid: str, chapter_uid: str, index: int) -> Path | None:
+    """在下载目录里找 ``<作品>/Chapter NNNN - 标题/0001.jpg``。"""
+    try:
+        offline = shelf_store.offline_detail(series_uid)
+    except Exception:  # noqa: BLE001
+        offline = None
+    if offline is None:
+        return None
+    series = offline["series"]
+    chapter = next((c for c in offline["chapters"] if c.get("uid") == chapter_uid), None)
+    title = sanitize_path_component(series.get("title") or "", "未命名作品")
+    # 下载器按 1 开始编号（0001.jpg），前端 index 从 0 开始
+    file_number = index + 1
+    for root in _download_roots():
+        series_dir = root / title
+        if not series_dir.is_dir():
+            continue
+        chapter_dir = None
+        try:
+            entries = list(series_dir.iterdir())
+        except OSError:
+            continue
+        for candidate in entries:
+            if not candidate.is_dir():
+                continue
+            if chapter and candidate.name.endswith(f" - {chapter.get('title')}"):
+                chapter_dir = candidate
+                break
+        if chapter_dir is None:
+            number = (chapter or {}).get("number")
+            for candidate in entries:
+                if candidate.is_dir() and candidate.name.startswith("Chapter ") and (
+                    number is None
+                    or str(candidate.name).split(" - ")[0].endswith(f"{number:04d}")
+                ):
+                    chapter_dir = candidate
+                    break
+        if chapter_dir is None:
+            continue
+        target = chapter_dir / f"{file_number:04d}"
+        for suffix in IMAGE_EXTENSIONS:
+            candidate = target.with_suffix(suffix)
+            if candidate.is_file():
+                return candidate
+        for candidate in chapter_dir.glob(f"{file_number:04d}.*"):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 下载
 # ---------------------------------------------------------------------------
@@ -923,16 +1072,36 @@ async def page_image(chapter_uid: str, index: int) -> Response:
 async def start_download(req: DownloadRequest) -> dict[str, Any]:
     try:
         task = await asyncio.to_thread(
-            tasks.submit, req.seriesUid, req.chapterUids, req.outputDir, req.workers
+            tasks.submit,
+            req.seriesUid,
+            req.chapterUids,
+            req.outputDir,
+            req.workers,
+            req.series,
+            req.chapters,
         )
     except SourceError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except DownloadPathError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, PermissionError) as exc:
+        raise HTTPException(400, f"下载目录不可用：{exc}") from exc
     return {"ok": True, "task": task}
 
 
 @app.get("/api/downloads")
 async def list_downloads(limit: int = 100) -> dict[str, Any]:
-    return {"tasks": tasks.list(limit), "history": tasks.history(50), "stats": tasks.stats()}
+    try:
+        effective = str(resolve_output_dir("", load_settings()).path)
+    except DownloadPathError:
+        effective = ""
+    return {
+        "tasks": tasks.list(limit),
+        "history": tasks.history(50),
+        "stats": tasks.stats(),
+        "effectiveOutputDir": effective,
+        "permission": android_storage.permission_info(),
+    }
 
 
 @app.post("/api/downloads/{task_id}/cancel")
@@ -941,6 +1110,15 @@ async def cancel_download(task_id: str) -> dict[str, Any]:
         return {"ok": True, "task": tasks.cancel(task_id)}
     except SourceError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/downloads/{task_id}/retry")
+async def retry_download(task_id: str) -> dict[str, Any]:
+    try:
+        task = await asyncio.to_thread(tasks.retry, task_id)
+    except SourceError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "task": task}
 
 
 @app.post("/api/downloads/clear")
@@ -969,7 +1147,9 @@ async def list_plugins() -> dict[str, Any]:
         "failed": registry.failed(),
         "dir": str(registry.plugin_dir()),
         "sourceDir": str(JSON_SOURCE_DIR),
-        "sourceFiles": sorted(p.name for p in JSON_SOURCE_DIR.glob("*.json"))
+        "sourceFiles": sorted(
+            [p.name for p in JSON_SOURCE_DIR.glob("*.json")] + [p.name for p in JSON_SOURCE_DIR.glob("*.js")]
+        )
         if JSON_SOURCE_DIR.is_dir()
         else [],
         "template": plugin_template(),
@@ -987,9 +1167,13 @@ async def read_plugin_file(file: str = "") -> dict[str, Any]:
 
 @app.get("/api/plugins/template")
 async def get_plugin_template(name: str = "my_source", display: str = "我的图源",
-                              base_url: str = "https://example.com") -> dict[str, Any]:
-    text = plugin_template(name=name, display=display, base_url=base_url)
+                              base_url: str = "https://example.com",
+                              kind: str = "py") -> dict[str, Any]:
     filename = re.sub(r"[^a-z0-9_]", "_", name.strip().lower()) or "my_source"
+    if kind == "js":
+        text = js_plugin_template(name=filename, display=display, base_url=base_url)
+        return {"filename": f"{filename}.js", "content": text}
+    text = plugin_template(name=name, display=display, base_url=base_url)
     return {"filename": f"{filename}.py", "content": text}
 
 
@@ -1055,9 +1239,137 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 """
 
 
+@app.get("/api/storage/permission")
+async def storage_permission() -> dict[str, Any]:
+    return android_storage.permission_info()
+
+
+@app.post("/api/storage/permission")
+async def request_storage_permission() -> dict[str, Any]:
+    if not android_storage.is_android():
+        raise HTTPException(501, "桌面版不需要存储权限")
+    return await asyncio.to_thread(android_storage.request_permission)
+
+
+@app.get("/api/fs/dirs")
+async def list_dirs(path: str = "") -> dict[str, Any]:
+    """安卓应用内目录浏览：只列公共存储里的文件夹，给前端选下载目录用。"""
+    if not android_storage.is_android():
+        raise HTTPException(501, "桌面版请用系统目录选择框")
+    root = android_storage.external_root()
+    if root is None:
+        raise HTTPException(500, "拿不到手机存储目录，请重启应用试试")
+    info = android_storage.permission_info()
+    if not info.get("granted"):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "需要「所有文件访问」权限才能浏览手机文件夹",
+                "need": info.get("need") or "all_files",
+                "permission": info,
+            },
+        )
+    target = Path(path).expanduser() if path.strip() else root
+    try:
+        target = target.resolve()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, "路径无效") from exc
+    if not in_public_storage(target):
+        raise HTTPException(403, "只能浏览手机存储里的文件夹")
+    if not target.is_dir():
+        raise HTTPException(404, "目录不存在")
+    try:
+        children = sorted(
+            (item for item in target.iterdir() if item.is_dir() and not item.name.startswith(".")),
+            key=lambda item: item.name.lower(),
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, f"没有权限读取这个目录：{exc}") from exc
+    except OSError as exc:
+        raise HTTPException(400, f"读取目录失败：{exc}") from exc
+    dirs = [
+        {
+            "name": item.name,
+            "path": str(item),
+            "writable": os.access(item, os.W_OK),
+        }
+        for item in children[:500]
+    ]
+    parent = ""
+    if target != root:
+        candidate = target.parent
+        if in_public_storage(candidate):
+            parent = str(candidate)
+    try:
+        label = str(target.relative_to(root)) or root.name
+    except ValueError:
+        label = target.name
+    if label in (".", ""):
+        label = "手机存储"
+    return {"path": str(target), "parent": parent, "label": label, "dirs": dirs}
+
+
+def _android_choose_folder(wanted: str) -> Any:
+    """安卓上确定下载目录：空 path 返回推荐的公共目录，否则校验用户给的目录。"""
+    info = android_storage.permission_info()
+    if not info.get("granted"):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": (
+                    "需要「所有文件访问」权限才能把漫画存到手机文件夹里，"
+                    "请点「去授权」，或在系统设置里给呆猫漫画打开该权限"
+                ),
+                "need": info.get("need") or "all_files",
+                "permission": info,
+            },
+        )
+    root = android_storage.external_root()
+    if root is None:
+        return JSONResponse(
+            status_code=500, content={"detail": "拿不到手机存储目录，请重启应用试试"}
+        )
+    if wanted.strip():
+        target = Path(wanted).expanduser()
+    else:
+        target = android_storage.default_public_dir() or root
+    if not in_public_storage(target):
+        return JSONResponse(
+            status_code=400, content={"detail": "只能选择手机存储里的文件夹"}
+        )
+    created = not target.exists()
+    ok, reason = probe_writable(target)
+    if not ok:
+        return JSONResponse(
+            status_code=400, content={"detail": f"这个文件夹不能写入：{reason}"}
+        )
+    try:
+        label = str(target.relative_to(root)) or target.name
+    except ValueError:
+        label = target.name
+    # 记下来作为下次下载的默认目录：用户选过一次就不用每次再选。
+    try:
+        current = load_settings()
+        if str(current.output_dir or "") != str(target) or current.output_subdir:
+            update_settings({"output_dir": str(target), "output_subdir": ""})
+    except Exception:  # noqa: BLE001 - 存不下也不该让选目录失败
+        log.warning("保存下载目录到设置失败", exc_info=True)
+    return {
+        "ok": True,
+        "path": str(target),
+        "label": label or "手机存储",
+        "writable": True,
+        "created": created,
+        "permission": info,
+    }
+
+
 @app.post("/api/choose-folder")
-async def choose_folder(req: PathRequest | None = None) -> dict[str, Any]:
-    initial = (req.path if req else "") or load_settings().output_dir
+async def choose_folder(req: OptionalPathRequest | None = None) -> Any:
+    wanted = (req.path if req else "") or ""
+    if android_storage.is_android():
+        return await asyncio.to_thread(_android_choose_folder, wanted)
+    initial = wanted or load_settings().output_dir
     if sys.platform != "win32":
         raise HTTPException(501, "当前系统不支持原生目录选择")
     env = dict(os.environ)
@@ -1090,7 +1402,46 @@ async def choose_folder(req: PathRequest | None = None) -> dict[str, Any]:
             feedback = ""
         for line in feedback.splitlines():
             log.info("目录选择：%s", line)
-    return {"ok": bool(path), "path": path}
+    if not path:
+        return {"ok": False, "path": "", "label": ""}
+    target = Path(path).expanduser()
+    created = not target.exists()
+    ok, reason = probe_writable(target)
+    if not ok:
+        raise HTTPException(400, f"这个文件夹不能写入：{reason}")
+    return {
+        "ok": True,
+        "path": str(target),
+        "label": target.name or str(target),
+        "writable": True,
+        "created": created,
+    }
+
+
+@app.post("/api/export")
+async def export_downloads(req: PathRequest | None = None) -> dict[str, Any]:
+    """把应用私有目录里的下载导出到手机「下载/呆猫漫画」（安卓专属）。"""
+    if not os.getenv("DUMBCAT_ANDROID"):
+        raise HTTPException(501, "只有手机版需要导出，桌面版直接打开目录即可")
+    path = Path((req.path if req else "") or load_settings().output_dir).expanduser()
+    if not path.exists():
+        raise HTTPException(404, "还没有下载任何内容")
+    try:
+        from java import jclass  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001 - 桌面上没有 Chaquopy
+        raise HTTPException(501, "当前环境没有安卓导出能力") from exc
+    try:
+        activity = jclass("com.dumbcat.manga.MainActivity")
+        count = await asyncio.to_thread(activity.exportToDownloads, str(path))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("导出失败：%s", exc)
+        raise HTTPException(400, f"导出失败：{exc}") from exc
+    files = int(count or 0)
+    if files <= 0:
+        raise HTTPException(
+            400, "没有可以导出的文件（目录是空的，或系统不允许写入「下载」目录）"
+        )
+    return {"ok": True, "files": files, "path": str(path)}
 
 
 @app.post("/api/open-folder")
@@ -1149,6 +1500,7 @@ async def suggest_folders() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 from dumbcat import shelf as shelf_store  # noqa: E402
+from dumbcat import progress as progress_store  # noqa: E402
 from dumbcat.sources.base import FavoritesUnsupported, LoginRequired  # noqa: E402
 
 SHELF_REMOTE_TIMEOUT = 20.0
@@ -1177,11 +1529,28 @@ class ShelfAddRequest(BaseModel):
     uid: str = ""
     source: str = ""
     series: dict[str, Any] = {}
+    #: 详情页当前的章节列表 / 简介：存成离线快照，源不可达时也能打开
+    chapters: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {}
 
 
 class ShelfRemoveRequest(BaseModel):
     shelfId: str = ""
     uid: str = ""
+
+
+class ShelfBulkRequest(BaseModel):
+    shelfId: str = ""
+    uids: list[str] = []
+    #: remove（移出）/ move（移到 targetShelfId）/ pin / unpin
+    action: str = ""
+    targetShelfId: str = ""
+
+
+class ShelfPinRequest(BaseModel):
+    shelfId: str = ""
+    uid: str = ""
+    pinned: bool = True
 
 
 class ShelfSyncRequest(BaseModel):
@@ -1201,6 +1570,9 @@ class ShelfHistoryRequest(BaseModel):
     page: int = 0
     total: int = 0
     ts: int = 0
+    #: 可选：阅读器手上已有的章节/简介快照，用于自动入架后可离线打开
+    chapters: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {}
 
 
 class ShelfHistoryRemoveRequest(BaseModel):
@@ -1383,7 +1755,15 @@ async def shelf_overview() -> dict[str, Any]:
 @app.get("/api/shelf/items")
 async def shelf_items(shelfId: str = "") -> dict[str, Any]:
     rows = await asyncio.to_thread(shelf_store.list_items, shelfId)
-    return {"items": rows}
+    # 书架列表只要卡片信息；章节快照可能有几千条，别整包塞给前端
+    lean: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        chapters = item.pop("chapters", None) or []
+        item["chapterCount"] = len(chapters)
+        item.pop("summary", None)
+        lean.append(item)
+    return {"items": lean}
 
 
 @app.get("/api/shelf/status")
@@ -1454,7 +1834,14 @@ async def shelf_add(req: ShelfAddRequest) -> dict[str, Any]:
 
     adapter, provider, remote = await _shelf_remote_state_for(source)
     try:
-        item = await asyncio.to_thread(shelf_store.add_item, shelf_id, payload, remote)
+        item = await asyncio.to_thread(
+            shelf_store.add_item,
+            shelf_id,
+            payload,
+            remote,
+            req.chapters,
+            req.summary,
+        )
     except shelf_store.ShelfError as exc:
         raise HTTPException(400, str(exc)) from exc
     if remote == "" and provider is not None:
@@ -1466,6 +1853,40 @@ async def shelf_add(req: ShelfAddRequest) -> dict[str, Any]:
         ) or item
     shelf = await asyncio.to_thread(shelf_store.get_shelf, shelf_id)
     return {"item": item, "remote": item.get("remote") or remote, "shelf": shelf}
+
+
+@app.post("/api/shelf/bulk")
+async def shelf_bulk(req: ShelfBulkRequest) -> dict[str, Any]:
+    """批量移出 / 移动 / 置顶：书架页长按进入多选后调用。"""
+    shelf_id = (req.shelfId or "").strip()
+    if not shelf_id:
+        raise HTTPException(400, "缺少书架 id")
+    try:
+        result = await asyncio.to_thread(
+            shelf_store.bulk_update,
+            shelf_id,
+            list(req.uids or []),
+            (req.action or "").strip(),
+            (req.targetShelfId or "").strip(),
+        )
+    except shelf_store.ShelfError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, **result}
+
+
+@app.post("/api/shelf/pin")
+async def shelf_pin(req: ShelfPinRequest) -> dict[str, Any]:
+    shelf_id = (req.shelfId or "").strip()
+    uid = (req.uid or "").strip()
+    if not shelf_id or not uid:
+        raise HTTPException(400, "缺少书架 id 或作品 uid")
+    try:
+        item = await asyncio.to_thread(shelf_store.pin_item, shelf_id, uid, bool(req.pinned))
+    except shelf_store.ShelfError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if item is None:
+        raise HTTPException(404, "书架里没有这本")
+    return {"ok": True, "item": item}
 
 
 @app.post("/api/shelf/remove")
@@ -1631,6 +2052,8 @@ async def shelf_history_add(req: ShelfHistoryRequest) -> dict[str, Any]:
         "page": req.page,
         "total": req.total,
         "ts": req.ts,
+        "chapters": req.chapters,
+        "summary": req.summary,
     }
     try:
         await asyncio.to_thread(shelf_store.history_add, record)
@@ -1652,3 +2075,38 @@ async def shelf_history_remove(req: ShelfHistoryRemoveRequest) -> dict[str, Any]
     except shelf_store.ShelfError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# 阅读进度（存在 SQLite，换壳/清缓存之后还能接上）
+# ---------------------------------------------------------------------------
+
+
+class ProgressRequest(BaseModel):
+    seriesUid: str = ""
+    chapterUid: str = ""
+    page: int = 0
+    offsetRatio: float = 0.0
+
+
+@app.get("/api/progress/{series_uid:path}")
+async def read_progress(series_uid: str) -> dict[str, Any]:
+    row = await asyncio.to_thread(progress_store.get, series_uid)
+    return {"progress": row}
+
+
+@app.post("/api/progress")
+async def save_progress(req: ProgressRequest) -> dict[str, Any]:
+    try:
+        row = await asyncio.to_thread(
+            progress_store.save, req.seriesUid, req.chapterUid, req.page, req.offsetRatio
+        )
+    except (ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "progress": row}
+
+
+@app.post("/api/progress/clear")
+async def clear_progress(req: ProgressRequest) -> dict[str, Any]:
+    removed = await asyncio.to_thread(progress_store.clear, req.seriesUid)
+    return {"ok": True, "removed": removed}

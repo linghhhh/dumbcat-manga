@@ -44,9 +44,9 @@ android {
         // 对外的首个公开版本用 0.1.0（见 README「版本说明」）。
         // versionCode 必须继续递增：内部 3.2.x 的 versionCode 是 5，
         // 退回 1 会让已安装的老用户无法升级安装。
-        // 0.2.0 这一版还会陆续加东西，versionName 保持不变，只递增 versionCode。
-        versionCode 8
-        versionName "0.2.0"
+        // 0.2.1：下载并入书架、自选保存文件夹、阅读器只保留条漫无缝滚动。
+        versionCode 11
+        versionName "0.2.1"
 
         ndk {
             // 64 位真机 + 老 32 位设备 + 模拟器
@@ -116,4 +116,10 @@ chaquopy {
 }
 
 dependencies {
+    // 内嵌 QuickJS：给「JS 图源」用（见 JsRuntime.java / plugins/js_source.py）
+    // 排除它带的 androidx.annotation：本项目不用 AndroidX（gradle.properties 里
+    // android.useAndroidX=false），注解只是编译期用到，运行时不需要。
+    implementation("io.github.taoweiji.quickjs:quickjs-android:1.4.6") {
+        exclude group: "androidx.annotation", module: "annotation"
+    }
 }

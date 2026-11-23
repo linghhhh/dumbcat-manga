@@ -9,7 +9,7 @@ import { loadSources } from './app.js';
 
 let rootRef = null;
 let aliveFlag = false;
-let state = { sources: [], logins: [], dir: '', sourceDir: '' };
+let state = { sources: [], logins: [], dir: '', sourceDir: '', failed: [] };
 
 export async function render(root) {
   rootRef = root;
@@ -44,6 +44,7 @@ async function refresh() {
       logins,
       dir: pluginInfo?.dir || '',
       sourceDir: pluginInfo?.sourceDir || '',
+      failed: Array.isArray(pluginInfo?.failed) ? pluginInfo.failed : [],
     };
   } catch (error) {
     if (!aliveFlag) return;
@@ -76,14 +77,16 @@ function draw() {
     ),
     el('div', { class: 'head-actions' },
       el('label', { class: 'btn primary', style: 'cursor:pointer' },
-        '📥 导入 .json',
+        '📥 导入图源',
         el('input', {
-          type: 'file', accept: '.json,application/json', style: 'display:none',
+          type: 'file', accept: '.json,.js,application/json,text/javascript', style: 'display:none',
           on: {
             change: async (event) => {
               const file = event.target.files?.[0];
               event.target.value = '';
-              if (file) await importJson(file);
+              if (!file) return;
+              if (/\.js$/i.test(file.name)) await importJs(file);
+              else await importJson(file);
             },
           },
         }),
@@ -117,7 +120,7 @@ function draw() {
   if (!items.length) {
     root.append(el('div', { class: 'empty-state', style: 'padding:40px' },
       el('strong', { text: '一个图源都没有' }),
-      el('div', { text: '可以点上面的「导入 .json」加一个自己写的规则图源。' })));
+      el('div', { text: '可以点上面的「导入图源」加一个自己写的规则图源（.json）或脚本图源（.js）。' })));
     return;
   }
 
@@ -135,12 +138,28 @@ function draw() {
     root.append(grid);
   }
 
+  if (state.failed.length) {
+    root.append(sectionHead(`加载失败（${state.failed.length}）`,
+      '文件还在，只是没能加载成图源；照着下面的提示改一改，或者删掉它。'));
+    const grid = el('div', { class: 'plugin-grid' });
+    for (const item of state.failed) {
+      grid.append(el('div', { class: 'plugin-card', style: 'border-color:rgba(255,120,120,.45)' },
+        el('div', { class: 'plugin-head' },
+          el('span', { class: 'plugin-icon', text: '⚠️' }),
+          el('div', {},
+            el('strong', { text: item.name || item.key || item.origin || '未知图源' }),
+            el('div', { class: 'sub', text: item.path || item.origin || '' }))),
+        el('p', { class: 'hint', style: 'margin:8px 0 0', text: item.error || '没有给出原因' })));
+    }
+    root.append(grid);
+  }
+
   root.append(el('div', { class: 'panel', style: 'margin-top:14px' },
     el('h2', { text: '想要更多图源？' }),
     el('p', {
       class: 'hint',
       text: '规则型图源就是一个 .json（engine 为 rules，里面写 CSS 选择器），导入后自动出现在上面的列表里。'
-        + '需要 Python 逻辑的图源请用插件形式放到用户插件目录。',
+        + '脚本型图源是一段 .js（调用 registerSource），跑在应用内嵌的 JavaScript 引擎里，能自己发请求、解析 HTML、解图片，适合登录/签名/切条这类规则写不出来的站点；需要完整 Python 能力的图源仍然放到用户插件目录。',
     }),
     el('div', { class: 'row', style: 'gap:8px;flex-wrap:wrap' },
       el('button', {
@@ -309,6 +328,46 @@ async function importJson(file) {
   if (!ok) return;
   try {
     await api.savePlugin(`${key}.json`, text);
+    toast('导入成功，已启用', { type: 'ok' });
+    await loadSources();
+    await refresh();
+  } catch (error) {
+    toast('导入失败', { type: 'error', detail: error.message });
+  }
+}
+
+async function importJs(file) {
+  let text = '';
+  try {
+    text = await file.text();
+  } catch (error) {
+    toast('读不了这个文件', { type: 'error', detail: error.message });
+    return;
+  }
+  if (!/registerSource\s*\(/.test(text)) {
+    toast('这不像一个 JS 图源', {
+      type: 'error',
+      detail: '文件里要调用 registerSource({...})，写法可以在「新建图源」里选 JS 模板看一眼。',
+    });
+    return;
+  }
+  const matched = text.match(/key\s*:\s*['"]([a-z][a-z0-9_]{1,31})['"]/);
+  const key = (matched ? matched[1] : file.name.replace(/\.js$/i, '')).trim().toLowerCase();
+  if (!/^[a-z][a-z0-9_]{1,31}$/.test(key)) {
+    toast('图源标识不合法', {
+      type: 'error',
+      detail: 'key 要小写字母开头，只含小写字母 / 数字 / 下划线，2-32 位。',
+    });
+    return;
+  }
+  const ok = await confirmDialog(
+    `导入 JS 图源「${key}」？`,
+    '脚本会在应用内嵌的 JavaScript 引擎里运行，能读写本机网络请求；只导入你信任的脚本。',
+    { okText: '导入' },
+  );
+  if (!ok) return;
+  try {
+    await api.savePlugin(`${key}.js`, text);
     toast('导入成功，已启用', { type: 'ok' });
     await loadSources();
     await refresh();

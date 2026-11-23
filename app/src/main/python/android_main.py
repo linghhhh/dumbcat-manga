@@ -28,7 +28,11 @@ MARKER = ".appdata-version"
 #: 老版本升级时必须重解压，否则会继续跑旧 appdata（没有书架接口）。
 #: 11 → 12：内置图源全部改为默认停用（json 里的 enabled: false），
 #: 已安装的老版本升级后也必须重解压，否则还会加载旧的启用状态。
-APPDATA_VERSION = "13"
+#: 12 → 13：图源管理页、下载设置页。
+#: 13 → 14：阅读器手势模块（viewer.js）、离线书架/下载弹窗改动，
+#: 老版本升级后必须重解压，否则前端还是旧版、后端新接口对不上。
+#: 14 → 15：书架三标签、下载并入书架页、自选保存文件夹、阅读器去掉单页模式。
+APPDATA_VERSION = "16"
 
 
 def log(message: str) -> None:
@@ -133,28 +137,92 @@ def _wait_ready(port: int, timeout: float = 90.0) -> bool:
     return False
 
 
+def _writable_download_dir(default: Path) -> Path:
+    """按「公共目录（已授权）→ 应用私有目录」的顺序找第一个能写的位置。"""
+    from dumbcat.android_storage import default_public_dir, permission_info
+    from dumbcat.download_paths import probe_writable
+
+    candidates: list[Path] = []
+    if permission_info().get("granted"):
+        public = default_public_dir()
+        if public is not None:
+            candidates.append(public)
+    candidates.append(default)
+    for path in candidates:
+        ok, reason = probe_writable(path)
+        if ok:
+            return path
+        log(f"下载目录不可写：{path}（{reason}）")
+    return default
+
+
 def _prepare_settings(output_dir: Path, home: Path) -> None:
-    """第一次启动时把下载目录、浏览器图源开关写成手机上的默认值。"""
+    """首次启动写入手机默认值；之后每次启动校验下载目录，失效就换个能写的地方。"""
     try:
+        from dumbcat.download_paths import app_private_dir, probe_writable
+        from dumbcat.android_storage import default_public_dir, permission_info
         from dumbcat.server.config import WEB_CONFIG_PATH, load_settings, save_settings
 
-        if WEB_CONFIG_PATH.exists():
-            return
         settings = load_settings()
-        settings.output_dir = str(output_dir)
-        # 手机上没有 Chromium，浏览器型图源先关掉，界面里还能手动打开
-        settings.include_browser_sources = False
-        settings.workers = min(settings.workers, 4)
-        settings.image_workers = min(settings.image_workers, 4)
-        settings.image_cache_mb = 256
-        # 首屏别落在需要梯子/浏览器的源上，qimanga 直连 JSON 接口最稳
-        settings.last_source = "qimanga"
-        # 手机竖屏窄，卡片窄一点一屏能放两三列
-        settings.grid_min_width = 110
-        save_settings(settings)
-        log("已写入首启配置")
+        changed = False
+        if not WEB_CONFIG_PATH.exists():
+            settings.output_dir = str(output_dir)
+            # 手机上没有 Chromium，浏览器型图源先关掉，界面里还能手动打开
+            settings.include_browser_sources = False
+            settings.workers = min(settings.workers, 4)
+            settings.image_workers = min(settings.image_workers, 4)
+            settings.image_cache_mb = 256
+            # 首屏别落在需要梯子/浏览器的源上，qimanga 直连 JSON 接口最稳
+            settings.last_source = "qimanga"
+            # 手机竖屏窄，卡片窄一点一屏能放两三列
+            settings.grid_min_width = 110
+            changed = True
+
+        target: Path | None = None
+        try:
+            if str(settings.output_dir or "").strip():
+                target = Path(str(settings.output_dir)).expanduser()
+        except (OSError, ValueError):
+            target = None
+        ok, reason = probe_writable(target) if target is not None else (False, "未设置")
+        if not ok:
+            replacement = _writable_download_dir(output_dir)
+            log(f"下载目录 {target} 不可用（{reason}），改用 {replacement}")
+            settings.output_dir = str(replacement)
+            changed = True
+            target = replacement
+        # 已经给了「所有文件访问」权限、但设置里还停在应用私有目录：换成公共目录，
+        # 这样用户在文件管理器里能直接看到下载的漫画。
+        private = app_private_dir()
+        public = default_public_dir() if permission_info().get("granted") else None
+        if target is not None and private is not None and public is not None and target == private:
+            public_ok, public_reason = probe_writable(public)
+            if public_ok:
+                log(f"下载目录从私有目录切到公共目录：{public}")
+                settings.output_dir = str(public)
+                changed = True
+            else:
+                log(f"公共目录不可写，继续用私有目录：{public_reason}")
+
+        if changed:
+            save_settings(settings)
+            log(f"已更新手机配置：下载目录={settings.output_dir}")
     except Exception as exc:  # noqa: BLE001
         log(f"写入首启配置失败：{exc}")
+
+
+def _register_js_prelude(home: Path) -> None:
+    """把 prelude.js 的绝对路径交给 Java 侧的 QuickJS 运行时。"""
+    prelude = home / "jsruntime" / "prelude.js"
+    if not prelude.is_file():
+        log(f"没找到 {prelude}，JS 图源不可用")
+        return
+    try:
+        from dumbcat.plugins import js_bridge
+
+        js_bridge.set_prelude_path(str(prelude))
+    except Exception as exc:  # noqa: BLE001 - 桌面版没有 java 模块
+        log(f"登记 prelude 失败：{exc}")
 
 
 def start(files_dir: str, cache_dir: str, apk_path: str,
@@ -173,8 +241,9 @@ def start(files_dir: str, cache_dir: str, apk_path: str,
     for path in (home / "web", config_home, runtime, output):
         try:
             path.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
+        except OSError as exc:
+            # 以前这里是静默 pass：目录没建出来，用户点下载只看到一句英文报错
+            log(f"创建目录失败：{path}（{exc}）")
     # 用户插件目录（解压包里不含空目录）
     (home / "用户插件").mkdir(parents=True, exist_ok=True)
 
@@ -182,11 +251,15 @@ def start(files_dir: str, cache_dir: str, apk_path: str,
     os.environ["DUMBCAT_APPDATA"] = str(config_home)
     os.environ["DUMBCAT_JSON_DIR"] = str(home / "json")
     os.environ["DUMBCAT_OUTPUT"] = str(output)
+    #: 应用私有默认目录：用户没选目录时的兜底，也用来判断设置里是不是还没换过目录
+    os.environ["DUMBCAT_APP_OUTPUT"] = str(output)
     os.environ["MANGA_RUNTIME_DIR"] = str(runtime)
     # 手机网络慢，首屏别在后台抢流量
     os.environ.setdefault("DUMBCAT_NO_WARMUP", "1")
-    # 让设置页知道自己在手机上：下载根目录不可改，只能改子目录
+    # 让设置页知道自己在手机上：下载根目录由用户自己选
     os.environ["DUMBCAT_ANDROID"] = "1"
+    # JS 图源运行时：prelude.js 随 appdata 解压到 home/web 旁边
+    _register_js_prelude(home)
 
     log(f"root={home} output={output}")
 

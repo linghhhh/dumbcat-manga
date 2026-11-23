@@ -6,8 +6,6 @@ import * as browse from './browse.js';
 import * as search from './search.js';
 import * as detail from './detail.js';
 import * as reader from './reader.js';
-import * as downloads from './downloads.js';
-import * as downloadSettings from './download-settings.js';
 import * as shelf from './shelf.js';
 import * as plugins from './plugins.js';
 import * as sourcesPage from './sources.js';
@@ -20,8 +18,6 @@ const ROUTES = [
   { name: 'search', pattern: /^\/?search\/?$/, mod: search, title: '搜索' },
   { name: 'series', pattern: /^\/?series\/(.+)$/, mod: detail, title: '作品' },
   { name: 'read', pattern: /^\/?read\/(.+)$/, mod: reader, title: '阅读' },
-  { name: 'downloads', pattern: /^\/?downloads\/?$/, mod: downloads, title: '下载' },
-  { name: 'download-settings', pattern: /^\/?download-settings\/?$/, mod: downloadSettings, title: '下载设置' },
   { name: 'shelf', pattern: /^\/?shelf\/?$/, mod: shelf, title: '书架' },
   { name: 'plugins', pattern: /^\/?plugins\/?$/, mod: plugins, title: '图源插件' },
   { name: 'sources', pattern: /^\/?sources\/?$/, mod: sourcesPage, title: '图源管理' },
@@ -201,6 +197,15 @@ function setNav(name) {
 }
 
 async function route() {
+  // 旧的 #/downloads 独立下载页并进了书架第三个标签：老链接原地改成 #/shelf?tab=downloads
+  const rawPath = location.hash.replace(/^#/, '').split('?')[0];
+  if (/^\/?(downloads|download-settings)\/?$/i.test(rawPath)) {
+    try {
+      history.replaceState(null, '', '#/shelf?tab=downloads');
+    } catch (error) {
+      location.hash = '#/shelf?tab=downloads';
+    }
+  }
   const parsed = parseHash();
   if (booted && !backSuppressed) {
     backDepth = Math.min(MAX_BACK_DEPTH, backDepth + 1);

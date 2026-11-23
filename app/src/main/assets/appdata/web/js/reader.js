@@ -1,16 +1,12 @@
-/* 阅读器：条漫/单页两种模式，记进度、键盘翻页、预取下一章。 */
+/* 阅读器：竖向滚动（条漫）阅读，记进度、键盘翻页、预取下一章。 */
 import { api, withToken } from './api.js';
 import { el, clear, toast, loadLocal, saveLocal, openModal, closeModal } from './util.js';
 import { navigate } from './util.js';
+import { createViewer } from './viewer.js';
 
 let state = null;
 let rootRef = null;
 let cleanup = null;
-
-const MODES = {
-  scroll: { label: '条漫', icon: '☰' },
-  single: { label: '单页', icon: '▣' },
-};
 
 function progressKey(seriesUid) {
   return `reader.progress.${seriesUid || 'unknown'}`;
@@ -69,7 +65,25 @@ export async function render(root, params, ctx = {}) {
     return;
   }
 
-  const saved = loadLocal(progressKey(data.series?.uid), null);
+  /* 进度：本地的即时，服务端的权威（换壳/清缓存后本地就没了）。
+     服务端更新更晚才覆盖本地，离线时本地照样能接着看。 */
+  let saved = loadLocal(progressKey(data.series?.uid), null);
+  try {
+    const remote = await api.progress(data.series?.uid || '');
+    const served = remote && remote.progress;
+    if (served && served.chapterUid
+      && Number(served.updatedAt) * 1000 > Number(saved?.ts || 0)) {
+      saved = {
+        chapterUid: served.chapterUid,
+        index: Number(served.page) || 0,
+        offsetRatio: Number(served.offsetRatio) || 0,
+        ts: Number(served.updatedAt) * 1000,
+      };
+      saveLocal(progressKey(data.series?.uid), saved);
+    }
+  } catch (error) {
+    /* 拿不到服务端进度就当没有，本地记录继续用 */
+  }
   state = {
     series: data.series || {},
     chapter: data.chapter || {},
@@ -77,8 +91,6 @@ export async function render(root, params, ctx = {}) {
     pages: (data.pages || []).map((page, index) => ({ index, ...page })),
     chapters: [],
     index: 0,
-    mode: loadLocal('reader.mode', 'scroll') === 'single' ? 'single' : 'scroll',
-    fit: loadLocal('reader.fit', 'width'),
     prefetch: null,
     saved: saved && saved.chapterUid === (data.chapterUid || chapterUid) ? saved : null,
     nextUid: null,
@@ -87,6 +99,8 @@ export async function render(root, params, ctx = {}) {
     hideTimer: 0,
     scrollHandler: null,
     keyHandler: null,
+    viewer: null,
+    restoreObserver: null,
   };
   if (!state.pages.length) {
     clear(root);
@@ -97,13 +111,15 @@ export async function render(root, params, ctx = {}) {
     ));
     return;
   }
+  if (data.offline) {
+    toast('离线模式：正在读本地缓存', { type: 'info' });
+  }
   state.index = Math.min(state.saved?.index || 0, state.pages.length - 1);
 
   draw();
   bindKeys();
   await loadChapterList();
-  if (state.mode === 'single') showSingle(state.index, { silent: true });
-  else restoreScroll();
+  restoreScroll();
   reportHistory(true);
 }
 
@@ -122,24 +138,10 @@ async function loadChapterList() {
       // 保证阅读器标题栏与浏览历史上报都有话名。
       state.chapter = { ...(state.chapter || {}), ...state.chapters[index] };
     }
-    const select = document.getElementById('readerChapterSelect');
-    if (select) fillChapterSelect(select);
     updatePager();
   } catch (error) {
     console.warn('章节表读取失败', error);
   }
-}
-
-function fillChapterSelect(select) {
-  clear(select);
-  state.chapters.forEach((chapter, index) => {
-    const option = el('option', {
-      value: chapter.uid,
-      text: `${chapter.locked ? '🔒 ' : ''}${chapter.title || `第 ${chapter.number || index + 1} 话`}`,
-    });
-    if (chapter.uid === state.chapterUid) option.selected = true;
-    select.append(option);
-  });
 }
 
 /* ------------------------------ 结构 ------------------------------ */
@@ -152,7 +154,7 @@ function draw() {
   clear(root);
   const container = el('div', { class: 'reader' });
   container.append(topBar(), el('div', { class: 'reader-progress' }, el('i', { id: 'readerProgress' })));
-  const pages = el('div', { class: 'reader-pages', id: 'readerPages', dataset: { mode: state.mode } });
+  const pages = el('div', { class: 'reader-pages', id: 'readerPages' });
   state.pages.forEach((page) => pages.append(pageEl(page)));
   prefetch(state.pages.slice(1, 5));
   container.append(pages, pagerEl());
@@ -160,14 +162,13 @@ function draw() {
   container.classList.toggle('light', loadLocal('reader.light', false) === true);
   requestAnimationFrame(() => {
     const pagesEl = document.getElementById('readerPages');
-    state.scrollHandler = () => {
-      if (state.mode === 'scroll') onScroll();
-      else updateProgressBar();
-    };
+    state.scrollHandler = onScroll;
     (pagesEl || window).addEventListener('scroll', state.scrollHandler, { passive: true });
     updateProgressBar();
   });
-  applyModeStyles();
+  /* 手势层：双指 / 双击按坐标找图缩放，scale === 1 时完全不拦截滚动 */
+  state.viewer?.destroy();
+  state.viewer = createViewer(pages);
   bindUiToggle(container);
 }
 
@@ -185,6 +186,8 @@ function bindUiToggle(container) {
     if (Math.abs((event.touches[0]?.clientY || 0) - startY) > 8) moved = true;
   }, { passive: true });
   pages.addEventListener('click', (event) => {
+    /* 刚做过滑动翻页 / 双击缩放时，浏览器仍可能补一个 click，别让它把菜单切出来 */
+    if (Number(pages.dataset.suppressUntil || 0) > Date.now()) return;
     if (moved) return;
     if (!isTouchLayout()) return;
     if (event.target.closest('button, select, input, a')) return;
@@ -205,17 +208,6 @@ function scheduleHideUi(container) {
 }
 
 function topBar() {
-  const chapterSelect = el('select', {
-    id: 'readerChapterSelect',
-    title: '跳章节',
-    on: {
-      change: (event) => {
-        const uid = event.target.value;
-        if (uid && uid !== state.chapterUid) navigate(`#/read/${uid}`);
-      },
-    },
-  });
-
   return el('div', { class: 'reader-top' },
     el('button', {
       class: 'btn small ghost', type: 'button',
@@ -225,7 +217,6 @@ function topBar() {
       el('div', { class: 'rt-title', text: state.series.title || '阅读' }),
       el('div', { class: 'rt-sub', text: state.chapter.title || '' }),
     ),
-    chapterSelect,
   );
 }
 
@@ -267,19 +258,12 @@ function pageEl(page) {
     img.style.minHeight = '120px';
   });
   img.src = withToken(page.url);
-  img.addEventListener('dblclick', () => {
-    if (state.mode === 'single') return;
-    const index = Number(img.dataset.index);
-    toggleMode();
-    showSingle(index);
-  });
   img.addEventListener('click', () => {
-    if (state.mode === 'single' || img.classList.contains('failed')) {
-      img.classList.remove('failed');
-      img.dataset.attempt = '0';
-      img.style.minHeight = '';
-      img.src = withToken(page.url);
-    }
+    if (!img.classList.contains('failed')) return;
+    img.classList.remove('failed');
+    img.dataset.attempt = '0';
+    img.style.minHeight = '';
+    img.src = withToken(page.url);
   });
   return img;
 }
@@ -294,9 +278,7 @@ function pagerEl() {
     value: String(Math.min(state.pages.length, state.index + 1)),
     on: {
       input: (event) => {
-        const index = Math.max(0, Number(event.target.value) - 1);
-        if (state.mode === 'single') showSingle(index);
-        else jumpTo(index);
+        jumpTo(Math.max(0, Number(event.target.value) - 1));
       },
     },
   });
@@ -317,14 +299,6 @@ function pagerEl() {
         class: 'btn tiny ghost', type: 'button',
         on: { click: openDirectory },
       }, '📑 目录'),
-      el('button', {
-        class: 'btn tiny ghost', id: 'readerModeBtn', type: 'button',
-        on: { click: toggleMode },
-      }, `${MODES[state.mode].icon} ${MODES[state.mode].label}`),
-      el('button', {
-        class: 'btn tiny ghost', id: 'readerFitBtn', type: 'button',
-        on: { click: toggleFit },
-      }, '适应宽度'),
       el('span', { class: 'page-pill', id: 'readerCounter', text: '1 / 1' }),
     ),
   );
@@ -377,74 +351,24 @@ function updatePager() {
   if (next) next.disabled = !state.nextUid;
 }
 
-function applyModeStyles() {
-  const pages = document.getElementById('readerPages');
-  if (!pages) return;
-  pages.dataset.mode = state.mode;
-  pages.dataset.fit = state.fit;
-  const fitButton = document.getElementById('readerFitBtn');
-  if (fitButton) fitButton.textContent = state.fit === 'height' ? '适应高度' : '适应宽度';
-  const modeButton = document.getElementById('readerModeBtn');
-  if (modeButton) modeButton.textContent = `${MODES[state.mode].icon} ${MODES[state.mode].label}`;
-  pages.querySelectorAll('img').forEach((img) => {
-    img.hidden = state.mode === 'single' && Number(img.dataset.index) !== state.index;
-  });
-}
-
-/* ------------------------------ 单页模式 ------------------------------ */
-function showSingle(index, options = {}) {
-  const target = Math.min(Math.max(0, index), state.pages.length - 1);
-  state.index = target;
-  const pages = scrollBox();
-  if (!pages) return;
-  pages.querySelectorAll('img').forEach((img) => {
-    img.hidden = Number(img.dataset.index) !== target;
-  });
-  pages.scrollTop = 0;
-  updatePager();
-  updateProgressBar();
-  if (!options.silent) saveProgressNow();
-  prefetchNearEnd();
-}
-
 function scrollBox() {
   return document.getElementById('readerPages');
 }
 
+/* 图片在滚动容器内容坐标里的顶部：用 rect 算，不依赖 offsetParent，
+   桌面端（上面还有顶栏）和手机端（容器 absolute）都能对齐。 */
+function imgTop(img, pages) {
+  return img.getBoundingClientRect().top - pages.getBoundingClientRect().top + pages.scrollTop;
+}
+
 function jumpTo(index) {
   const pages = scrollBox();
-  if (state.mode === 'single') {
-    showSingle(index);
-    return;
-  }
   const img = document.querySelector(`#readerPages img[data-index="${index}"]`);
   if (img && pages) {
-    pages.scrollTo({ top: img.offsetTop, behavior: 'smooth' });
+    pages.scrollTo({ top: imgTop(img, pages), behavior: 'smooth' });
     state.index = index;
     updatePager();
   }
-}
-
-function toggleMode() {
-  if (state.mode === 'scroll' && state.index >= 0) {
-    state.mode = 'single';
-    saveLocal('reader.mode', 'single');
-    applyModeStyles();
-    showSingle(state.index, { silent: true });
-  } else {
-    state.mode = 'scroll';
-    saveLocal('reader.mode', 'scroll');
-    applyModeStyles();
-    document.getElementById('readerPages')?.querySelectorAll('img')
-      .forEach((img) => { img.hidden = false; });
-    jumpTo(state.index);
-  }
-}
-
-function toggleFit() {
-  state.fit = state.fit === 'height' ? 'width' : 'height';
-  saveLocal('reader.fit', state.fit);
-  applyModeStyles();
 }
 
 function goChapter(uid) {
@@ -460,11 +384,14 @@ function currentScrollIndex() {
   const pages = scrollBox();
   if (!pages) return state.index;
   const images = Array.from(pages.querySelectorAll('img'));
+  const contentTop = pages.getBoundingClientRect().top - pages.scrollTop;
+  const center = pages.scrollTop + pages.clientHeight / 2;
   let best = 0;
   let bestDistance = Infinity;
   for (const img of images) {
-    const center = img.offsetTop + img.offsetHeight / 2;
-    const distance = Math.abs(center - (pages.scrollTop + pages.clientHeight / 2));
+    const rect = img.getBoundingClientRect();
+    const middle = rect.top - contentTop + rect.height / 2;
+    const distance = Math.abs(middle - center);
     if (distance < bestDistance) {
       bestDistance = distance;
       best = Number(img.dataset.index);
@@ -487,16 +414,11 @@ function onScroll() {
 function updateProgressBar() {
   const fill = document.getElementById('readerProgress');
   if (!fill) return;
-  const total = state.pages.length || 1;
   const pages = scrollBox();
-  let percent;
-  if (state.mode === 'single') {
-    percent = ((state.index + 1) / total) * 100;
-  } else if (pages) {
+  let percent = 0;
+  if (pages) {
     const scrollable = Math.max(1, pages.scrollHeight - pages.clientHeight);
     percent = ((pages.scrollTop + pages.clientHeight) / (scrollable + pages.clientHeight)) * 100;
-  } else {
-    percent = 0;
   }
   fill.style.width = `${Math.max(1, Math.min(100, percent))}%`;
 }
@@ -517,6 +439,13 @@ function reportHistory(force = false) {
   historyReporter.key = key;
   historyReporter.at = now;
   const series = state.series || {};
+  const chapters = (state.chapters || []).map((chapter) => ({
+    uid: chapter.uid,
+    title: chapter.title || '',
+    number: chapter.number ?? null,
+    index: chapter.index ?? 0,
+    locked: Boolean(chapter.locked),
+  }));
   api.shelfHistoryAdd({
     uid: series.uid || '',
     source: series.provider || series.key || '',
@@ -526,6 +455,16 @@ function reportHistory(force = false) {
     chapterTitle: state.chapter.title || '',
     page: state.index,
     total: state.pages.length,
+    chapters,
+    summary: {
+      description: series.description || '',
+      status: series.status || '',
+      tags: series.tags || [],
+      url: series.url || '',
+      nsfw: Boolean(series.nsfw),
+      providerName: series.providerName || '',
+      coverUrl: series.coverUrl || '',
+    },
   }).catch(() => {});
 }
 
@@ -536,27 +475,99 @@ function scheduleSave() {
 
 function saveProgressNow() {
   if (!state) return;
-  saveLocal(progressKey(state.series.uid), {
+  const ratio = currentOffsetRatio();
+  const payload = {
     chapterUid: state.chapterUid,
     index: state.index,
+    /* 章内偏移：条漫一张图可能一屏放不下，只记 index 会跳回图顶 */
+    offsetRatio: ratio,
     title: state.chapter.title || '',
     at: Date.now(),
-  });
+    ts: Date.now(),
+  };
+  saveLocal(progressKey(state.series.uid), payload);
+  api.saveProgress({
+    seriesUid: state.series.uid || '',
+    chapterUid: state.chapterUid,
+    page: state.index,
+    offsetRatio: ratio,
+  }).catch(() => {});
   reportHistory();
 }
 
+/* 视口中线落在当前页的百分之几（0~1），条漫定位就靠它 */
+function currentOffsetRatio() {
+  const pages = scrollBox();
+  if (!pages) return 0;
+  const img = pages.querySelector(`img[data-index="${state.index}"]`);
+  const height = img?.getBoundingClientRect().height || 0;
+  if (!img || !height) return 0;
+  const raw = (pages.scrollTop + pages.clientHeight / 2 - imgTop(img, pages)) / height;
+  return Math.max(0, Math.min(1, raw));
+}
+
+/* 恢复阅读位置：等目标图真正解码完再定位（占位高度会让位置算错），
+   之后图片陆续撑开高度时用 ResizeObserver 校正几次，用户一动就交还控制权。 */
 function restoreScroll() {
-  if (!state.saved?.index) return;
-  requestAnimationFrame(() => {
-    const pages = scrollBox();
-    const img = document.querySelector(`#readerPages img[data-index="${state.saved.index}"]`);
-    if (pages && img) pages.scrollTop = img.offsetTop;
+  const saved = state.saved;
+  if (!saved) return;
+  if (!saved.index && !saved.offsetRatio) return;
+  const pages = scrollBox();
+  const img = pages?.querySelector(`img[data-index="${saved.index}"]`);
+  if (!pages || !img) return;
+
+  const ratio = Math.max(0, Math.min(0.98, Number(saved.offsetRatio) || 0));
+  const apply = () => {
+    if (!state || scrollBox() !== pages) return;
+    const max = Math.max(0, pages.scrollHeight - pages.clientHeight);
+    const height = img.getBoundingClientRect().height;
+    const top = imgTop(img, pages) + height * ratio - pages.clientHeight / 2;
+    pages.scrollTop = Math.max(0, Math.min(max, top));
+  };
+  const ready = (img.complete && img.naturalWidth > 0)
+    ? Promise.resolve()
+    : new Promise((resolve) => {
+      const done = () => {
+        img.removeEventListener('load', done);
+        img.removeEventListener('error', done);
+        resolve();
+      };
+      img.addEventListener('load', done);
+      img.addEventListener('error', done);
+      setTimeout(done, 4000);
+    });
+
+  ready.then(() => {
+    if (!state || scrollBox() !== pages) return;
+    apply();
+    const stop = () => {
+      state?.restoreObserver?.disconnect();
+      if (state) state.restoreObserver = null;
+      clearTimeout(timer);
+      pages.removeEventListener('wheel', stop);
+      pages.removeEventListener('touchstart', stop);
+    };
+    let timer = 0;
+    if (typeof ResizeObserver !== 'function') {
+      setTimeout(apply, 600);
+      return;
+    }
+    let corrections = 0;
+    state.restoreObserver = new ResizeObserver(() => {
+      apply();
+      corrections += 1;
+      if (corrections >= 5) stop();
+    });
+    state.restoreObserver.observe(pages);
+    timer = setTimeout(stop, 5000);
+    pages.addEventListener('wheel', stop, { passive: true, once: true });
+    pages.addEventListener('touchstart', stop, { passive: true, once: true });
   });
 }
 
 /* ------------------------------ 预取 ------------------------------ */
 function prefetchNearEnd() {
-  if (!state.nextUid || state.prefetch || state.mode !== 'scroll') return;
+  if (!state.nextUid || state.prefetch) return;
   if (state.index < state.pages.length - 3) return;
   state.prefetch = state.nextUid;
   api.chapter(state.nextUid).then((data) => {
@@ -576,30 +587,13 @@ function bindKeys() {
     const key = event.key;
     if (key === 'ArrowRight' || key === 'PageDown' || key === ' ') {
       event.preventDefault();
-      if (state.mode === 'single') {
-        if (state.index + 1 < state.pages.length) showSingle(state.index + 1);
-        else goChapter(state.nextUid);
-      } else {
-        if (state.index + 1 < state.pages.length) jumpTo(state.index + 1);
-        else goChapter(state.nextUid);
-      }
+      if (state.index + 1 < state.pages.length) jumpTo(state.index + 1);
+      else goChapter(state.nextUid);
       return;
     }
     if (key === 'ArrowLeft' || key === 'PageUp') {
       event.preventDefault();
-      if (state.mode === 'single') {
-        if (state.index > 0) showSingle(state.index - 1);
-        else goChapter(state.prevUid);
-      } else if (state.index > 0) {
-        jumpTo(state.index - 1);
-      }
-      return;
-    }
-    if (key === 'ArrowDown' || key === 'ArrowUp') {
-      if (state.mode === 'single') {
-        event.preventDefault();
-        showSingle(state.index + (key === 'ArrowDown' ? 1 : -1));
-      }
+      if (state.index > 0) jumpTo(state.index - 1);
       return;
     }
     if (key === 'f' || key === 'F') {
@@ -626,6 +620,12 @@ export function unmount() {
   if (cleanup) {
     try { cleanup(); } catch {}
     cleanup = null;
+  }
+  if (state?.restoreObserver) {
+    try { state.restoreObserver.disconnect(); } catch {}
+  }
+  if (state?.viewer) {
+    try { state.viewer.destroy(); } catch {}
   }
   document.body.classList.remove('reading');
   if (state?.scrollHandler) {

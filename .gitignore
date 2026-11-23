@@ -34,6 +34,8 @@ tools/icon_src.jpg
 # ---- 临时文件 / 草稿 ----
 tmp/
 .scratch/
+# 本地跑 python 服务时自动生成的运行目录
+.DumbCatMangaRuntime/
 *.log
 *.tmp
 

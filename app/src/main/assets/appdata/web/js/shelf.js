@@ -1,5 +1,6 @@
 /* 书架：多书架（可自建）、图源收藏同步、浏览历史。 */
 import { api } from './api.js';
+import * as downloadsTab from './downloads.js';
 import { seriesCard } from './cards.js';
 import { activateCovers } from './lazy.js';
 import {
@@ -24,6 +25,12 @@ function emptyStateData() {
     activeShelfId: '',
     loading: true,
     error: '',
+    /* 多选模式：批量移出 / 移动 / 置顶 */
+    selecting: false,
+    selected: new Set(),
+    /* 下载缓存标签：由 downloads.js 挂载，切走时整体卸载（含 SSE 退订） */
+    dlHost: null,
+    dlMounted: false,
     alive: () => true,
   };
 }
@@ -44,6 +51,8 @@ function pickActiveShelf(shelves, wanted) {
 
 async function loadContent() {
   if (!state.data) return;
+  /* 下载缓存自己拉 /api/downloads，不用书架的接口 */
+  if (state.mode === 'downloads') return;
   if (state.mode === 'history') {
     const res = await api.shelfHistory(200);
     state.history = res.items || [];
@@ -82,9 +91,52 @@ async function reload() {
 
 /* ------------------------------ 动作 ------------------------------ */
 
+function exitSelect() {
+  if (!state) return;
+  state.selecting = false;
+  state.selected = new Set();
+}
+
+/* 标签与地址栏同步：切标签不整页重渲染，只换 hash，刷新/收藏还能落回同一个标签 */
+function syncTabHash(mode) {
+  const target = mode === 'shelf' ? '#/shelf' : `#/shelf?tab=${encodeURIComponent(mode)}`;
+  if (location.hash === target) return;
+  try {
+    history.replaceState(null, '', target);
+  } catch (error) {
+    /* file:// 或某些 WebView 不允许改地址，忽略即可，页面状态已经切好了 */
+  }
+}
+
+function leaveDownloads() {
+  if (!state) return;
+  downloadsTab.unmount();
+  state.dlHost = null;
+  state.dlMounted = false;
+}
+
+function mountDownloads(host) {
+  if (!state || !host || state.dlMounted) return;
+  state.dlMounted = true;
+  downloadsTab.renderInto(host).catch((error) => {
+    if (!state) return;
+    state.dlMounted = false;
+    toast(error.message || '下载队列没打开', { type: 'error' });
+  });
+}
+
 async function setMode(mode) {
-  if (state.mode === mode) return;
+  if (!state || state.mode === mode) return;
+  if (state.mode === 'downloads') leaveDownloads();
   state.mode = mode;
+  syncTabHash(mode);
+  exitSelect();
+  if (mode === 'downloads') {
+    // 队列页自己会转菊花再拉数据，不用书架的骨架屏
+    state.loading = false;
+    if (rootEl) draw();
+    return;
+  }
   state.loading = true;
   if (rootEl) draw();
   await loadContent();
@@ -107,6 +159,7 @@ async function createShelf() {
     toast(`书架「${shelf.name}」建好了`, { type: 'ok' });
     if (shelf?.id) state.activeShelfId = shelf.id;
     state.mode = 'shelf';
+    syncTabHash('shelf');
     state.loading = true;
     draw();
     await reload();
@@ -186,19 +239,32 @@ async function removeItem(item) {
 /* ------------------------------ 渲染 ------------------------------ */
 
 function headEl() {
+  if (state.mode === 'downloads') {
+    // 标题区跟着标签走：下载缓存不再顶着「书架」大标题，也不重复解释
+    return sectionTitle('下载缓存');
+  }
+  if (state.mode === 'history') {
+    const count = state.data?.historyCount || 0;
+    return sectionTitle('浏览历史', count ? `最近看过的 ${count} 部作品` : '看过的作品会记在这里');
+  }
   return sectionTitle('书架', '多书架 / 图源收藏 / 浏览历史',
     el('button', { class: 'btn primary', type: 'button', on: { click: createShelf } }, '＋ 新建书架'));
 }
 
 function segmentEl() {
   const seg = el('div', { class: 'shelf-seg' });
-  const mk = (mode, label, icon) => el('button', {
+  const mk = (mode, icon, ...kids) => el('button', {
     class: `shelf-seg-btn${state.mode === mode ? ' active' : ''}`,
     type: 'button',
     on: { click: () => setMode(mode) },
-  }, el('span', { class: 'shelf-seg-icon', text: icon }), label);
+  }, el('span', { class: 'shelf-seg-icon', text: icon }), ...kids);
   const count = state.data?.historyCount || 0;
-  seg.append(mk('shelf', '书架', '📚'), mk('history', `浏览历史${count ? ` · ${count}` : ''}`, '🕘'));
+  seg.append(
+    mk('shelf', '📚', '书架'),
+    mk('history', '🕘', '浏览历史',
+      count ? el('i', { class: 'shelf-seg-badge', text: count > 99 ? '99+' : String(count) }) : null),
+    mk('downloads', '📥', '下载缓存'),
+  );
   return seg;
 }
 
@@ -266,8 +332,29 @@ function gridEl() {
       el('span', { class: 'shelf-bar-count', text: `${state.items.length} 本` }),
       shelf && shelf.kind === 'source' ? el('span', { class: 'shelf-acc-tag', text: '跟图源收藏同步' }) : null,
     ),
+    shelf && shelf.kind === 'source'
+      ? el('div', { class: 'shelf-bar-tools' },
+        el('button', {
+          class: 'btn tiny ghost',
+          type: 'button',
+          title: '从图源再拉一次收藏；连不上时书架里的旧条目仍然能打开',
+          on: { click: (event) => syncSourceShelf(shelf, event.currentTarget) },
+        }, '同步收藏'),
+      )
+      : null,
     shelf && shelf.kind !== 'source'
       ? el('div', { class: 'shelf-bar-tools' },
+        el('button', {
+          class: `btn tiny ${state.selecting ? 'primary' : 'ghost'}`,
+          type: 'button',
+          on: {
+            click: () => {
+              if (state.selecting) exitSelect();
+              else state.selecting = true;
+              draw();
+            },
+          },
+        }, state.selecting ? '完成' : '选择'),
         el('button', { class: 'icon-btn', type: 'button', title: '重命名', on: { click: () => renameShelf(shelf) } }, '✏️'),
         el('button', { class: 'icon-btn', type: 'button', title: '删除书架', on: { click: () => deleteShelf(shelf) } }, '🗑️'),
       )
@@ -296,7 +383,49 @@ function gridEl() {
       nsfw: item.nsfw,
       providerName: item.providerName || item.key,
     }, { coverWidth: 260, showSource: true, onOpen: () => navigate(`#/series/${item.uid}`) });
-    const holder = el('div', { class: 'shelf-item' }, card);
+    const holder = el('div', {
+      class: `shelf-item${state.selecting && state.selected.has(item.uid) ? ' selected' : ''}`,
+    }, card);
+    if (state.selecting) {
+      holder.append(el('span', {
+        class: 'shelf-check',
+        text: state.selected.has(item.uid) ? '✓' : '',
+      }));
+      holder.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleSelected(item.uid);
+      }, true);
+    } else {
+      /* 长按进多选：手机上比找按钮快 */
+      let pressTimer = 0;
+      holder.addEventListener('touchstart', () => {
+        pressTimer = setTimeout(() => {
+          state.selecting = true;
+          state.selected.add(item.uid);
+          draw();
+        }, 480);
+      }, { passive: true });
+      const cancelPress = () => clearTimeout(pressTimer);
+      holder.addEventListener('touchmove', cancelPress, { passive: true });
+      holder.addEventListener('touchend', cancelPress);
+      holder.addEventListener('touchcancel', cancelPress);
+    }
+    if (Number(item.pin || 0) > 0) {
+      holder.append(el('span', {
+        class: 'chip',
+        style: 'position:absolute;right:8px;top:8px;font-size:10px;pointer-events:none',
+        title: '已置顶',
+      }, '📌'));
+    }
+    const cached = Number(item.chapterCount || (Array.isArray(item.chapters) ? item.chapters.length : 0));
+    if (cached) {
+      holder.append(el('div', {
+        class: 'chip',
+        style: 'position:absolute;left:8px;bottom:8px;font-size:10px;pointer-events:none',
+        title: '书架里存了章节快照，断网或图源挂掉时也能打开',
+      }, `已存 ${cached} 章`));
+    }
     holder.append(el('button', {
       class: 'shelf-item-x',
       type: 'button',
@@ -312,8 +441,99 @@ function gridEl() {
     grid.append(holder);
   }
   wrap.append(grid);
+  if (state.selecting) wrap.append(selectBarEl(shelf));
   requestAnimationFrame(() => activateCovers(grid));
   return wrap;
+}
+
+/* 多选操作条：置顶 / 移动 / 移出 */
+function selectBarEl(shelf) {
+  const count = state.selected.size;
+  const allChecked = count > 0 && count === state.items.length;
+  return el('div', { class: 'shelf-select-bar' },
+    el('button', {
+      class: 'btn tiny ghost', type: 'button',
+      on: {
+        click: () => {
+          if (allChecked) state.selected.clear();
+          else state.selected = new Set(state.items.map((item) => item.uid));
+          draw();
+        },
+      },
+    }, allChecked ? '取消全选' : '全选'),
+    el('span', { class: 'shelf-select-count', text: `已选 ${count} 本` }),
+    el('div', { class: 'shelf-select-actions' },
+      el('button', {
+        class: 'btn tiny ghost', type: 'button', disabled: count ? null : true,
+        on: { click: () => bulkAction('pin') },
+      }, '置顶'),
+      el('button', {
+        class: 'btn tiny ghost', type: 'button', disabled: count ? null : true,
+        on: { click: () => chooseShelfToMove() },
+      }, '移动'),
+      el('button', {
+        class: 'btn tiny danger', type: 'button', disabled: count ? null : true,
+        on: { click: () => bulkAction('remove') },
+      }, '移出'),
+    ),
+  );
+}
+
+function toggleSelected(uid) {
+  if (!state) return;
+  if (state.selected.has(uid)) state.selected.delete(uid);
+  else state.selected.add(uid);
+  draw();
+}
+
+async function bulkAction(action, targetShelfId = '') {
+  const uids = Array.from(state.selected);
+  if (!uids.length) {
+    toast('先选几本吧', { type: 'warn' });
+    return;
+  }
+  if (action === 'remove') {
+    const ok = await confirmDialog('移出书架？', `把选中的 ${uids.length} 本移出「${activeShelf()?.name || '书架'}」？图源收藏不会被取消。`, { danger: true, okText: '移出' });
+    if (!ok) return;
+  }
+  try {
+    const res = await api.shelfBulk({ shelfId: state.activeShelfId, uids, action, targetShelfId });
+    const labels = { remove: '移出', move: '移动', pin: '置顶', unpin: '取消置顶' };
+    toast(`已${labels[action] || action} ${res.count || uids.length} 本`, { type: 'ok' });
+    exitSelect();
+    await reload();
+  } catch (error) {
+    toast('操作没成功', { type: 'error', detail: error.message });
+  }
+}
+
+/* 移动：弹层里挑目标书架 */
+function chooseShelfToMove() {
+  const shelves = (state.data?.shelves || []).filter((item) => item.id !== state.activeShelfId && item.kind !== 'source');
+  if (!shelves.length) {
+    toast('没有别的书架可以移过去', { type: 'warn' });
+    return;
+  }
+  const list = el('div', { class: 'shelf-move-list' });
+  const box = el('div', { style: 'min-width:260px' },
+    el('h3', { style: 'margin:0 0 12px', text: '移到哪个书架' }),
+    list,
+  );
+  openModal(box);
+  for (const shelf of shelves) {
+    list.append(el('button', {
+      class: 'btn ghost', type: 'button', style: 'width:100%;justify-content:space-between',
+      on: {
+        click: () => {
+          closeModal();
+          bulkAction('move', shelf.id);
+        },
+      },
+    },
+      el('span', { text: shelf.name }),
+      el('span', { class: 'hint', text: `${shelf.count || 0} 本` }),
+    ));
+  }
 }
 
 function historyEl() {
@@ -380,6 +600,33 @@ function historyEl() {
   return wrap;
 }
 
+/* 源收藏架：手动再同步一次；图源连不上就只提示，不影响已存的条目 */
+async function syncSourceShelf(shelf, button) {
+  const source = shelf.source || String(shelf.id || '').replace(/^s_source_/, '');
+  if (!source) {
+    toast('这个书架没有记录图源', { type: 'warn' });
+    return;
+  }
+  const label = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = '同步中…';
+  }
+  try {
+    const res = await api.shelfSync(source, 2);
+    const count = Number(res?.added ?? res?.total ?? 0);
+    toast(count ? `已更新 ${count} 本` : '没有新的收藏', { type: 'ok' });
+    await reload();
+  } catch (error) {
+    toast('这次没同步上，书架里的条目还能打开', { type: 'warn', detail: error.message });
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label || '同步收藏';
+    }
+  }
+}
+
 async function clearHistory() {
   const ok = await confirmDialog('清空浏览历史？', '只清掉这台手机上的阅读进度记录，作品和图源收藏不受影响。', { danger: true, okText: '清空' });
   if (!ok) return;
@@ -404,8 +651,8 @@ async function removeHistory(item) {
 }
 
 function draw() {
-  if (!rootEl) return;
-  if (!state.data && state.error) {
+  if (!rootEl || !state) return;
+  if (!state.data && state.error && state.mode !== 'downloads') {
     clear(rootEl);
     rootEl.append(headEl(), el('div', { class: 'empty-state' },
       el('div', { class: 'big', text: '😿' }),
@@ -418,6 +665,13 @@ function draw() {
 
   clear(rootEl);
   rootEl.append(headEl(), segmentEl());
+  if (state.mode === 'downloads') {
+    // 先有容器再挂模块：下载队列自己管加载 / 重绘 / SSE
+    if (!state.dlHost) state.dlHost = el('section', { class: 'shelf-panel dl-tab' });
+    rootEl.append(state.dlHost);
+    mountDownloads(state.dlHost);
+    return;
+  }
   if (state.data) {
     if (state.mode === 'history') {
       rootEl.append(historyEl());
@@ -455,7 +709,7 @@ function pickerRow(shelf, checked) {
 }
 
 /** 收藏弹窗：选书架（可现场新建）。返回 { saved } 或 null（取消）。 */
-export async function openShelfPicker(series) {
+export async function openShelfPicker(series, snapshot = {}) {
   const uid = series && series.uid;
   if (!uid) {
     toast('这本书没有 uid，收不进书架', { type: 'error' });
@@ -547,7 +801,14 @@ export async function openShelfPicker(series) {
     const remotes = [];
     try {
       for (const shelfId of wanted) {
-        const res = await api.shelfAdd({ shelfId, uid, source: sourceKey, series });
+        const res = await api.shelfAdd({
+          shelfId,
+          uid,
+          source: sourceKey,
+          series,
+          chapters: snapshot.chapters || [],
+          summary: snapshot.summary || {},
+        });
         remotes.push(res.remote || '');
       }
       for (const shelfId of dropped) {
@@ -590,13 +851,15 @@ export async function openShelfPicker(series) {
 export async function render(view, params = {}, ctx = {}) {
   rootEl = view;
   state = emptyStateData();
-  state.mode = params.tab === 'history' ? 'history' : 'shelf';
+  const tab = String(params.tab || '').trim();
+  state.mode = tab === 'history' || tab === 'downloads' ? tab : 'shelf';
   state.alive = ctx.alive || (() => true);
   draw();
   await reload();
 }
 
 export function unmount() {
+  leaveDownloads();
   rootEl = null;
   state = null;
 }

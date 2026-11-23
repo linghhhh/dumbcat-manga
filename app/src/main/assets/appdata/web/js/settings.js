@@ -40,7 +40,7 @@ function draw() {
   ));
 
   const grid = el('div', { class: 'settings-grid' });
-  grid.append(appearancePanel(), browsePanel(), downloadPanel(), cachePanel(), aboutPanel());
+  grid.append(appearancePanel(), readerPanel(), browsePanel(), downloadPanel(), cachePanel(), aboutPanel());
   root.append(grid);
 }
 
@@ -171,9 +171,16 @@ function markTheme(theme) {
   });
 }
 
+function readerPanel() {
+  return panel('阅读', '竖向滚动（条漫）阅读：每张图横向铺满屏幕、首尾相接，上下滑动连续看。',
+    el('div', { class: 'hint', text: '翻页、目录、进度都在阅读页底部；双击或双指可以放大看细节。' }),
+  );
+}
+
 function browsePanel() {
   return panel('浏览与加载', '封面按需加载，滑到底部自动翻页。',
     switchField('滑到底自动加载下一页', 'auto_load_more', '关掉后需要点「加载下一页」'),
+    numberField('浏览历史最多留几条', 'history_limit', { min: 100, max: 3000, step: 100, hint: '超出的旧记录自动丢掉；清空历史在书架页。' }),
     switchField('章节新→旧排列', 'chapter_newest_first', '下次打开详情页生效'),
     switchField('包含需要浏览器渲染的图源', 'include_browser_sources', '慢一些，但能抓到动态站', async () => {
       try {
@@ -189,15 +196,15 @@ function downloadPanel() {
   const dirLine = android
     ? el('code', { class: 'chip', text: [saved.output_dir, saved.output_subdir].filter(Boolean).join('/') })
     : el('span', { class: 'hint', text: saved.output_dir || '' });
-  return panel('下载', '目录、每章最多几张、同时下几张，都在「下载」页里改。',
+  return panel('下载', '下载队列、历史和保存位置都在「下载缓存」页里。',
     el('div', { class: 'field' },
       el('label', { text: '现在的保存位置' }),
       dirLine,
     ),
     el('button', {
       class: 'btn', type: 'button',
-      on: { click: () => { location.hash = '#/download-settings'; } },
-    }, '⬇️ 打开下载设置'),
+      on: { click: () => { location.hash = '#/shelf?tab=downloads'; } },
+    }, '⬇️ 打开下载缓存'),
   );
 }
 

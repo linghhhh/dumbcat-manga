@@ -2,14 +2,19 @@ package com.dumbcat.manga;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.drawable.Drawable;
+import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
@@ -27,7 +32,13 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
@@ -43,6 +54,157 @@ public class MainActivity extends Activity {
     private static boolean sPythonStarted = false;
     /** Python 服务起来后的完整地址；Activity 被重建时直接拿它加载，不用再等。 */
     private static volatile String sServerUrl = null;
+    /** 应用上下文：Python 侧导出下载文件时静态调用要用。 */
+    private static volatile Context sAppCtx = null;
+
+    /** 下载开始时调用：拉起前台服务，让系统别把进程回收。 */
+    public static void startDownloadService() {
+        DownloadService.start(sAppCtx);
+    }
+
+    /** 队列清空后调用。 */
+    public static void stopDownloadService() {
+        DownloadService.stop(sAppCtx);
+    }
+
+    /** 通知栏进度。 */
+    public static void updateDownloadNotification(int done, int total, String text) {
+        DownloadService.update(done, total, text);
+    }
+
+    // ---------- 存储权限（下载目录选择用） ----------
+    /** 当前 Activity：申请权限/跳设置页要用。 */
+    private static volatile MainActivity sCurrentActivity = null;
+
+    /** 是否有权写公共存储：Android 11+ 看「所有文件访问」，6~10 看写权限。 */
+    public static boolean hasStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                return Environment.isExternalStorageManager();
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Context ctx = sAppCtx;
+            if (ctx == null) {
+                return false;
+            }
+            return ctx.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        }
+        return true;
+    }
+
+    /** "all_files"（11+ 需授权）/ "legacy_write"（6~10 运行时权限）/ "none"。 */
+    public static String storagePermissionKind() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return hasStorageAccess() ? "none" : "all_files";
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            return hasStorageAccess() ? "none" : "legacy_write";
+        }
+        return "none";
+    }
+
+    public static boolean isExternalStorageManaged() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                return Environment.isExternalStorageManager();
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    public static boolean canRequestStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            return !hasStorageAccess();
+        }
+        return false;
+    }
+
+    public static int storageApiLevel() {
+        return Build.VERSION.SDK_INT;
+    }
+
+    /** 公共存储根目录（一般 /storage/emulated/0）。 */
+    public static String externalStorageRoot() {
+        try {
+            java.io.File dir = Environment.getExternalStorageDirectory();
+            if (dir != null) {
+                return dir.getAbsolutePath();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Context ctx = sAppCtx;
+            java.io.File ext = ctx == null ? null : ctx.getExternalFilesDir(null);
+            if (ext != null) {
+                return ext.getAbsolutePath();
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
+    }
+
+    /** 拉起系统授权界面：11+ 跳「所有文件访问」，6~10 弹运行时权限。 */
+    public static boolean requestStorageAccess() {
+        MainActivity activity = sCurrentActivity;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (hasStorageAccess()) {
+                return true;
+            }
+            if (activity == null) {
+                return false;
+            }
+            try {
+                Intent intent = new Intent(
+                        android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:" + activity.getPackageName()));
+                activity.startActivity(intent);
+                return true;
+            } catch (Exception first) {
+                Log.w(TAG, "跳转应用所有文件访问页失败，改用总列表", first);
+                try {
+                    activity.startActivity(new Intent(
+                            android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                    return true;
+                } catch (Exception second) {
+                    Log.w(TAG, "打开所有文件访问设置失败", second);
+                    return false;
+                }
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (activity == null) {
+                return false;
+            }
+            try {
+                activity.requestPermissions(
+                        new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 1002);
+                return true;
+            } catch (Exception exc) {
+                Log.w(TAG, "申请写入权限失败", exc);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 打开站点登录窗口（安卓上没有 Chromium，登录用真实 WebView 完成）。 */
+    public static void openLoginWindow(String url) {
+        if (sAppCtx == null) {
+            throw new IllegalStateException("应用上下文还没准备好");
+        }
+        LoginActivity.open(sAppCtx, url);
+    }
+
+    /** 读登录窗口里该站点留下的 Cookie，返回 JSON 数组。 */
+    public static String readLoginCookies(String url, String baseUrl) {
+        return LoginActivity.readCookies(url, baseUrl);
+    }
 
     private WebView web;
     private View splash;
@@ -54,6 +216,22 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        sAppCtx = getApplicationContext();
+        sCurrentActivity = this;
+        // Android 10 及以下导出到公共下载目录需要写存储权限
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q
+                && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                    new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 1002);
+        }
+        // Android 13+ 通知要单独授权，不给也能下载，只是看不到进度
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                    new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1003);
+        }
 
         Window window = getWindow();
         // 和网页顶栏同色，系统栏不抢戏；图标用深色
@@ -76,6 +254,20 @@ public class MainActivity extends Activity {
             }
             // 服务可能正由上一个（已销毁的）Activity 的线程启动，这里轮询等它就绪
             pollServer();
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        sCurrentActivity = this;
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (sCurrentActivity == this) {
+            sCurrentActivity = null;
         }
     }
 
@@ -254,9 +446,11 @@ public class MainActivity extends Activity {
             String externalDir = "";
             try {
                 java.io.File ext = getExternalFilesDir(null);
-                if (ext != null) {
-                    externalDir = ext.getAbsolutePath();
+                if (ext == null) {
+                    // 外部存储不可用（USB 挂载被占等）时退回内部目录，下载仍然能跑
+                    ext = getFilesDir();
                 }
+                externalDir = ext.getAbsolutePath();
             } catch (Exception ignored) {
             }
 
@@ -370,5 +564,132 @@ public class MainActivity extends Activity {
             web = null;
         }
         super.onDestroy();
+    }
+
+    // ------------------------------------------------------------------
+    // 下载导出：应用私有目录 -> 公共「下载/呆猫漫画」
+    // ------------------------------------------------------------------
+
+    /** 公共下载目录里的应用子目录名。 */
+    private static final String EXPORT_FOLDER = "呆猫漫画";
+
+    /**
+     * 把 {@code srcDir} 下的所有文件导出到系统「下载/呆猫漫画」。
+     *
+     * <p>Python 侧通过 Chaquopy 静态调用；返回复制成功的文件数。
+     * Android 10+ 走 MediaStore（不需要存储权限），更老的版本直接写
+     * 公共下载目录再用 MediaScanner 登记。
+     */
+    public static int exportToDownloads(String srcDir) throws Exception {
+        Context ctx = sAppCtx;
+        if (ctx == null) {
+            throw new IllegalStateException("应用上下文还没准备好");
+        }
+        File root = new File(srcDir);
+        if (!root.isDirectory()) {
+            return 0;
+        }
+        List<File> files = new ArrayList<>();
+        collectFiles(root, root, files);
+        int copied = 0;
+        for (File file : files) {
+            String rel = root.toURI().relativize(file.toURI()).getPath().replace('/', File.separatorChar);
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    if (copyViaMediaStore(ctx, file, rel)) {
+                        copied++;
+                    }
+                } else if (copyLegacy(ctx, file, rel)) {
+                    copied++;
+                }
+            } catch (Exception exc) {
+                Log.w(TAG, "导出失败 " + rel, exc);
+            }
+        }
+        return copied;
+    }
+
+    private static void collectFiles(File root, File dir, List<File> out) {
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (File child : children) {
+            if (child.isDirectory()) {
+                collectFiles(root, child, out);
+            } else if (child.isFile()) {
+                out.add(child);
+            }
+        }
+    }
+
+    private static boolean copyViaMediaStore(Context ctx, File file, String rel) throws Exception {
+        int slash = rel.lastIndexOf(File.separatorChar);
+        String sub = slash > 0 ? rel.substring(0, slash) : "";
+        String name = slash >= 0 ? rel.substring(slash + 1) : rel;
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Downloads.DISPLAY_NAME, name);
+        values.put(MediaStore.Downloads.MIME_TYPE, mimeOf(name));
+        values.put(MediaStore.Downloads.RELATIVE_PATH,
+                "Download/" + EXPORT_FOLDER + (sub.isEmpty() ? "" : "/" + sub.replace(File.separatorChar, '/')));
+        values.put(MediaStore.Downloads.IS_PENDING, 1);
+        Uri uri = ctx.getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) {
+            return false;
+        }
+        try (InputStream in = new FileInputStream(file);
+             OutputStream out = ctx.getContentResolver().openOutputStream(uri)) {
+            if (out == null) {
+                return false;
+            }
+            copyStream(in, out);
+        }
+        values.clear();
+        values.put(MediaStore.Downloads.IS_PENDING, 0);
+        ctx.getContentResolver().update(uri, values, null, null);
+        return true;
+    }
+
+    @SuppressWarnings("deprecation")
+    private static boolean copyLegacy(Context ctx, File file, String rel) throws Exception {
+        File base = new File(Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOWNLOADS), EXPORT_FOLDER);
+        File dest = new File(base, rel);
+        File parent = dest.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            return false;
+        }
+        try (InputStream in = new FileInputStream(file);
+             OutputStream out = new FileOutputStream(dest)) {
+            copyStream(in, out);
+        }
+        MediaScannerConnection.scanFile(ctx, new String[]{dest.getAbsolutePath()}, null, null);
+        return true;
+    }
+
+    private static void copyStream(InputStream in, OutputStream out) throws Exception {
+        byte[] buffer = new byte[64 * 1024];
+        int read;
+        while ((read = in.read(buffer)) > 0) {
+            out.write(buffer, 0, read);
+        }
+        out.flush();
+    }
+
+    private static String mimeOf(String name) {
+        String lower = name.toLowerCase();
+        if (lower.endsWith(".png")) {
+            return "image/png";
+        }
+        if (lower.endsWith(".webp")) {
+            return "image/webp";
+        }
+        if (lower.endsWith(".gif")) {
+            return "image/gif";
+        }
+        if (lower.endsWith(".txt")) {
+            return "text/plain";
+        }
+        return "image/jpeg";
     }
 }

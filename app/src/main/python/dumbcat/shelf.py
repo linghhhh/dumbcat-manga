@@ -1,11 +1,12 @@
 """书架 / 官方收藏 / 阅读历史的本地存储层。
 
-纯标准库：JSON 落盘、原子写（``.tmp`` + :func:`os.replace`）、进程内可重入锁。
-这里完全不碰网络，也不 import 任何图源；远端收藏由路由层（``server/app.py``）
-通过 provider 的 ``add_favorite`` / ``remove_favorite`` 调用后再回写 ``remote`` 状态。
+主存 SQLite（``dumbcat.server.db`` 的 ``shelf`` / ``shelf_item`` 两张表 +
+``meta`` 里的历史记录），旧版 ``shelves.json`` 首次启动时自动迁进来。
+进程内可重入锁；这里完全不碰网络，也不 import 任何图源；远端收藏由路由层
+（``server/app.py``）通过 provider 的 ``add_favorite`` / ``remove_favorite``
+调用后再回写 ``remote`` 状态。
 
-存储文件：``dumbcat.app_config.APP_CONFIG_DIR / "shelves.json"``
-结构（与 docs/书架接口.md 第 2 节一致）::
+内存里的结构（读写函数都用它，改完交给 :func:`_write_store` 整体同步）::
 
     {
       "version": 1,
@@ -13,10 +14,12 @@
       "shelves": [{"id", "name", "kind", "source", "created", "updated"}],
       "items":   [{"id", "shelfId", "uid", "source", "key", "title", "cover",
                    "coverUrl", "author", "tags", "nsfw", "url", "providerName",
-                   "added", "remote"}],
+                   "added", "remote", "chapters", "summary", "updated"}],
       "history": [{"uid", "source", "title", "cover", "coverUrl", "chapterUid",
                    "chapterTitle", "page", "total", "ts"}]
     }
+
+数据库不可用时自动退回旧版 JSON 落盘（``shelves.json``），不会丢数据。
 """
 from __future__ import annotations
 
@@ -46,6 +49,16 @@ LEGACY_SHELF_NAME = "旧版下载"
 SOURCE_SHELF_PREFIX = "s_source_"
 
 MAX_HISTORY = 500
+
+
+def _history_limit() -> int:
+    """历史条数上限：设置里可调，读不到设置就用默认值。"""
+    try:
+        from dumbcat.server.config import load_settings
+
+        return max(100, min(3000, int(load_settings().history_limit or MAX_HISTORY)))
+    except Exception:  # noqa: BLE001 - 设置坏了不该影响历史
+        return MAX_HISTORY
 MAX_NAME = 60
 
 _TAG_SPLIT = re.compile(r"[,，/|、;；]+")
@@ -214,11 +227,73 @@ def _series_fields(series: dict[str, Any], uid: str, source: str) -> dict[str, A
     }
 
 
-def _new_item(shelf_id: str, series: dict[str, Any], remote: str = "") -> dict[str, Any]:
+MAX_SNAPSHOT_CHAPTERS = 6000
+
+
+def _chapter_snapshot(chapters: Any) -> list[dict[str, Any]]:
+    """把章节列表压成可离线展示的快照（只留展示与定位用得到的字段）。"""
+    if not isinstance(chapters, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in chapters[:MAX_SNAPSHOT_CHAPTERS]:
+        if not isinstance(entry, dict):
+            continue
+        uid = _text(entry.get("uid"), 200)
+        if not uid:
+            continue
+        try:
+            number = float(entry.get("number")) if entry.get("number") not in (None, "") else None
+        except (TypeError, ValueError):
+            number = None
+        out.append(
+            {
+                "uid": uid,
+                "title": _text(entry.get("title"), 200),
+                "number": number,
+                "index": _int(entry.get("index")),
+                "locked": _bool(entry.get("locked")),
+            }
+        )
+    return out
+
+
+def _summary_snapshot(series: dict[str, Any]) -> dict[str, Any]:
+    """作品详情的离线快照：书架/历史断网时靠它把详情页画出来。"""
+    data = series if isinstance(series, dict) else {}
+    cover = _clean_cover(
+        data.get("cover") or data.get("coverUrl") or data.get("coverRemote") or ""
+    )
+    return {
+        "uid": _text(data.get("uid"), 200),
+        "title": _text(data.get("title") or data.get("name"), 200),
+        "author": _text(data.get("author") or data.get("artist"), 100),
+        "cover": cover,
+        "coverUrl": cover,
+        "description": _text(data.get("description") or data.get("summary"), 4000),
+        "tags": _tags_of(data.get("tags")),
+        "status": _text(data.get("status"), 60),
+        "url": _text(data.get("url") or data.get("link"), 1000),
+        "nsfw": _bool(data.get("nsfw")),
+        "providerName": _text(data.get("providerName"), 60),
+        "updated": _now(),
+    }
+
+
+def _new_item(
+    shelf_id: str,
+    series: dict[str, Any],
+    remote: str = "",
+    chapters: Any = None,
+    summary: Any = None,
+) -> dict[str, Any]:
     data = series if isinstance(series, dict) else {}
     uid = _uid_of(data, _source_of(data))
     source = _source_of(data, uid)
     fields = _series_fields(data, uid, source)
+    snap = _summary_snapshot(data) if isinstance(summary, dict) else _summary_snapshot(data)
+    if isinstance(summary, dict) and summary:
+        snap.update({k: v for k, v in summary.items() if v not in (None, "", [], {})})
+    snap["uid"] = uid or snap.get("uid", "")
     return {
         "id": _new_id("i"),
         "shelfId": shelf_id,
@@ -234,7 +309,10 @@ def _new_item(shelf_id: str, series: dict[str, Any], remote: str = "") -> dict[s
         "url": fields["url"],
         "providerName": fields["providerName"],
         "added": _now(),
+        "updated": _now(),
         "remote": remote if remote in _REMOTE_STATES else "",
+        "chapters": _chapter_snapshot(chapters),
+        "summary": snap,
     }
 
 
@@ -351,6 +429,7 @@ def _sanitize(raw: dict[str, Any]) -> dict[str, Any]:
         source = _text(entry.get("source"), 40) or _text(entry.get("key"), 40) or _source_from_uid(uid)
         cover = _clean_cover(entry.get("cover") or entry.get("coverUrl") or "")
         remote = entry.get("remote")
+        summary = entry.get("summary") if isinstance(entry.get("summary"), dict) else {}
         items.append(
             {
                 "id": _text(entry.get("id"), 80) or _new_id("i"),
@@ -367,7 +446,10 @@ def _sanitize(raw: dict[str, Any]) -> dict[str, Any]:
                 "url": _text(entry.get("url"), 1000),
                 "providerName": _text(entry.get("providerName"), 60) or source,
                 "added": _int(entry.get("added")),
+                "updated": _int(entry.get("updated")) or _int(entry.get("added")),
                 "remote": remote if remote in _REMOTE_STATES else "",
+                "chapters": _chapter_snapshot(entry.get("chapters")),
+                "summary": _summary_snapshot({**summary, "uid": uid, "title": _text(entry.get("title"), 200), "author": _text(entry.get("author"), 100), "cover": cover, "providerName": _text(entry.get("providerName"), 60)}),
             }
         )
     store["items"] = items
@@ -382,25 +464,154 @@ def _sanitize(raw: dict[str, Any]) -> dict[str, Any]:
             continue
         seen_history.add(uid)
         history.append(_history_public(entry))
-    store["history"] = history[:MAX_HISTORY]
+    store["history"] = history[:_history_limit()]
     return store
 
 
-def _load_from_disk() -> dict[str, Any]:
-    raw = _read_json(STORE_PATH)
-    if not isinstance(raw, dict):
-        if STORE_PATH.exists():
-            log.warning("书架数据格式不对，按空书架重建：%s", STORE_PATH)
-        return _new_store()
-    return _sanitize(raw)
+# ---------------------------------------------------------------------------
+# SQLite 读写（数据库不可用时退回 JSON）
+# ---------------------------------------------------------------------------
+
+_HISTORY_KEY = "shelf_history"
+_MIGRATED_KEY = "shelf_migrated"
 
 
-def _write_store(store: dict[str, Any]) -> None:
+def _database():
+    """按需打开数据库；不可用时返回 None（调用方退回 JSON）。"""
+    try:
+        from dumbcat.server import db as dbmod
+
+        with dbmod.lock():
+            return dbmod.conn()
+    except Exception as exc:  # pragma: no cover - 极端环境
+        log.warning("书架数据库不可用，继续用 JSON：%s", exc)
+        return None
+
+
+def _load_from_db() -> dict[str, Any] | None:
+    """从 SQLite 读回内存结构；库还是空的返回 None。"""
+    try:
+        from dumbcat.server import db as dbmod
+
+        rows = dbmod.query_all("SELECT * FROM shelf ORDER BY position, id")
+        if not rows:
+            return None
+        items = dbmod.query_all("SELECT * FROM shelf_item")
+        meta = {
+            str(row["key"]): row["value"]
+            for row in dbmod.query_all("SELECT key, value FROM meta")
+        }
+    except Exception as exc:  # pragma: no cover
+        log.warning("读取书架数据库失败：%s", exc)
+        return None
+
+    store = _new_store()
+    store["migrated"] = str(meta.get(_MIGRATED_KEY) or "") == "1"
+    shelves = []
+    for row in rows:
+        payload = dbmod.loads(row["payload"], {}) or {}
+        shelves.append(
+            {
+                "id": str(row["id"]),
+                "name": str(row["name"]),
+                "kind": str(row["kind"] or "local"),
+                "source": _text(payload.get("source"), 40),
+                "created": _int(payload.get("created")),
+                "updated": _int(row["updated_at"]) or _int(payload.get("updated")),
+            }
+        )
+    store["shelves"] = shelves
+    store["items"] = [
+        item for item in (dbmod.loads(row["payload"], None) for row in items) if isinstance(item, dict)
+    ]
+    history = dbmod.loads(meta.get(_HISTORY_KEY), [])
+    store["history"] = [entry for entry in history if isinstance(entry, dict)] if isinstance(history, list) else []
+    return store
+
+
+def _write_json(store: dict[str, Any]) -> None:
+    """数据库不可用时的退路：沿用旧版的原子写。"""
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = STORE_PATH.with_name(STORE_PATH.name + ".tmp")
     payload = json.dumps(store, ensure_ascii=False, indent=1)
     tmp.write_text(payload, encoding="utf-8")
     os.replace(tmp, STORE_PATH)
+
+
+def _write_store(store: dict[str, Any]) -> None:
+    """把整份内存结构同步进 SQLite（书架、收藏项、历史）。"""
+    try:
+        from dumbcat.server import db as dbmod
+
+        with dbmod.lock(), dbmod.transaction() as connection:
+            connection.execute("DELETE FROM shelf")
+            connection.execute("DELETE FROM shelf_item")
+            shelves = [shelf for shelf in store.get("shelves") or [] if isinstance(shelf, dict)]
+            connection.executemany(
+                "INSERT INTO shelf (id, name, kind, position, payload, updated_at) VALUES (?,?,?,?,?,?)",
+                [
+                    (
+                        _text(shelf.get("id"), 80),
+                        _text(shelf.get("name"), MAX_NAME) or "未命名书架",
+                        shelf.get("kind") if shelf.get("kind") in ("local", "source") else "local",
+                        index,
+                        dbmod.dumps({"source": _text(shelf.get("source"), 40), "created": _int(shelf.get("created")), "updated": _int(shelf.get("updated"))}),
+                        _int(shelf.get("updated")),
+                    )
+                    for index, shelf in enumerate(shelves)
+                ],
+            )
+            items = [item for item in store.get("items") or [] if isinstance(item, dict)]
+            connection.executemany(
+                "INSERT INTO shelf_item (shelf_id, uid, payload, remote, added, updated)"
+                " VALUES (?,?,?,?,?,?)",
+                [
+                    (
+                        _text(item.get("shelfId"), 80),
+                        _text(item.get("uid"), 200),
+                        dbmod.dumps(item),
+                        _text(item.get("remote"), 20),
+                        _int(item.get("added")),
+                        _int(item.get("updated")) or _int(item.get("added")),
+                    )
+                    for item in items
+                    if item.get("shelfId") and item.get("uid")
+                ],
+            )
+            for key, value in (
+                (_HISTORY_KEY, dbmod.dumps((store.get("history") or [])[:_history_limit()])),
+                (_MIGRATED_KEY, "1" if store.get("migrated") else "0"),
+            ):
+                connection.execute(
+                    "INSERT INTO meta (key, value) VALUES (?,?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+        return
+    except Exception as exc:  # pragma: no cover - 坏盘
+        log.warning("写入书架数据库失败，退回 JSON：%s", exc)
+    _write_json(store)
+
+
+def _load_from_disk() -> dict[str, Any]:
+    """优先读 SQLite；库里没有数据时把旧版 ``shelves.json`` 迁进来。"""
+    store = _load_from_db()
+    if store is not None and (store["shelves"] or store["items"] or store["history"]):
+        return store
+
+    raw = _read_json(STORE_PATH)
+    if not isinstance(raw, dict):
+        if STORE_PATH.exists():
+            log.warning("书架数据格式不对，按空书架重建：%s", STORE_PATH)
+        return _new_store()
+    store = _sanitize(raw)
+    _write_store(store)
+    try:  # 迁移完成，留个备份就行，避免下次又读一遍旧文件
+        STORE_PATH.replace(STORE_PATH.with_name(STORE_PATH.name + ".bak"))
+        log.info("旧版书架数据已迁移到 SQLite：%s", STORE_PATH.name)
+    except OSError:
+        pass
+    return store
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +804,13 @@ def list_items(shelf_id: str = "") -> list[dict[str, Any]]:
         for item in store["items"]
         if not target or item.get("shelfId") == target
     ]
-    rows.sort(key=lambda item: _int(item.get("added")), reverse=True)
+    rows.sort(
+        key=lambda item: (
+            -_int(item.get("pin")),
+            -_int(item.get("added")),
+            -_int(item.get("seq")),
+        )
+    )
     return rows
 
 
@@ -603,8 +820,14 @@ def get_item(shelf_id: str, uid: str) -> dict[str, Any] | None:
     return dict(item) if item is not None else None
 
 
-def add_item(shelf_id: str, series: dict[str, Any], remote: str = "") -> dict[str, Any]:
-    """把作品加入书架；同架同 uid 已存在时原样返回已有项（幂等）。"""
+def add_item(
+    shelf_id: str,
+    series: dict[str, Any],
+    remote: str = "",
+    chapters: Any = None,
+    summary: Any = None,
+) -> dict[str, Any]:
+    """把作品加入书架；同架同 uid 已存在时补一次快照并原样返回（幂等）。"""
     with _LOCK:
         store = load_store()
         shelf = _find_shelf(store, shelf_id)
@@ -616,9 +839,236 @@ def add_item(shelf_id: str, series: dict[str, Any], remote: str = "") -> dict[st
             raise ShelfError("缺少作品 uid")
         existing = _find_item(store, shelf["id"], uid)
         if existing is not None:
+            changed = _refresh_snapshot(existing, data, chapters, summary)
+            if changed:
+                _write_store(store)
             return dict(existing)
-        item = _new_item(shelf["id"], data, remote=remote)
+        item = _new_item(shelf["id"], data, remote=remote, chapters=chapters, summary=summary)
         item["uid"] = uid
+        item["seq"] = max((_int(row.get("seq")) for row in store["items"]), default=0) + 1
+        store["items"].append(item)
+        shelf["updated"] = _now()
+        _write_store(store)
+        return dict(item)
+
+
+def _refresh_snapshot(
+    item: dict[str, Any],
+    series: dict[str, Any],
+    chapters: Any,
+    summary: Any,
+) -> bool:
+    """已有书架项补快照：只在本次带了内容、且内容确实变了时写盘。"""
+    changed = False
+    snapshot = _chapter_snapshot(chapters)
+    if snapshot and snapshot != item.get("chapters"):
+        item["chapters"] = snapshot
+        changed = True
+    data = series if isinstance(series, dict) else {}
+    fields = _series_fields(data, item.get("uid", ""), item.get("source", ""))
+    fresh = _summary_snapshot(
+        {
+            **fields,
+            **(summary if isinstance(summary, dict) else {}),
+            "uid": item.get("uid", ""),
+        }
+    )
+    old = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+    if any(fresh.get(key) for key in ("description", "cover", "status", "tags")) and fresh != old:
+        item["summary"] = fresh
+        changed = True
+    if changed:
+        item["updated"] = _now()
+    return changed
+
+
+def refresh_item(
+    shelf_id: str,
+    uid: str,
+    series: dict[str, Any],
+    chapters: Any = None,
+    summary: Any = None,
+) -> dict[str, Any] | None:
+    """打开详情页时把最新章节/简介写回书架快照。"""
+    with _LOCK:
+        store = load_store()
+        item = _find_item(store, _text(shelf_id, 80), _text(uid, 200))
+        if item is None:
+            return None
+        if _refresh_snapshot(item, series, chapters, summary):
+            _write_store(store)
+        return dict(item)
+
+
+def pin_item(shelf_id: str, uid: str, pinned: bool = True) -> dict[str, Any] | None:
+    """置顶/取消置顶。置顶项排在有 pin 的组里，pin 值大的更靠前。"""
+    with _LOCK:
+        store = load_store()
+        item = _find_item(store, _text(shelf_id, 80), _text(uid, 200))
+        if item is None:
+            return None
+        if pinned:
+            current = max((_int(other.get("pin")) for other in store["items"]), default=0)
+            item["pin"] = max(current + 1, _int(item.get("pin")) + 1, 1)
+        else:
+            item["pin"] = 0
+        item["updated"] = _now()
+        _write_store(store)
+        return dict(item)
+
+
+def bulk_update(
+    shelf_id: str,
+    uids: list[str],
+    action: str,
+    target_shelf_id: str = "",
+) -> dict[str, Any]:
+    """批量移出 / 移动 / 置顶。只动本地书架，不碰图源收藏。"""
+    wanted = [_text(uid, 200) for uid in (uids or []) if _text(uid, 200)]
+    if not wanted:
+        raise ShelfError("没有选中任何作品")
+    with _LOCK:
+        store = load_store()
+        shelf = _find_shelf(store, shelf_id)
+        if shelf is None:
+            raise ShelfError("书架不存在")
+        picked = [item for item in store["items"] if item.get("uid") in wanted]
+        touched = len(picked)
+        if not touched:
+            return {"ok": True, "count": 0, "action": action}
+        if action == "remove":
+            store["items"] = [item for item in store["items"] if item not in picked]
+        elif action == "move":
+            target = _find_shelf(store, target_shelf_id)
+            if target is None:
+                raise ShelfError("目标书架不存在")
+            if target["id"] == shelf["id"]:
+                raise ShelfError("已经在这个书架里了")
+            keep: list[dict[str, Any]] = []
+            for item in store["items"]:
+                if item not in picked:
+                    keep.append(item)
+                    continue
+                exists = _find_item(store, target["id"], str(item.get("uid") or ""))
+                if exists is None:
+                    item["shelfId"] = target["id"]
+                    item["updated"] = _now()
+                    keep.append(item)
+            store["items"] = keep
+            target["updated"] = _now()
+        elif action in ("pin", "unpin"):
+            pinned = action == "pin"
+            current = max((_int(other.get("pin")) for other in store["items"]), default=0)
+            for item in picked:
+                if pinned:
+                    current += 1
+                    item["pin"] = current
+                else:
+                    item["pin"] = 0
+                item["updated"] = _now()
+        else:
+            raise ShelfError(f"不认识的操作：{action}")
+        shelf["updated"] = _now()
+        _write_store(store)
+        return {"ok": True, "count": touched, "action": action}
+
+
+def find_item_any_shelf(uid: str) -> dict[str, Any] | None:
+    """跨书架找作品（离线详情兜底用）。"""
+    target = _text(uid, 200)
+    if not target:
+        return None
+    store = load_store()
+    for item in store["items"]:
+        if item.get("uid") == target:
+            return dict(item)
+    return None
+
+
+def find_item_by_source_title(source: str, title: str) -> dict[str, Any] | None:
+    """历史里只有 uid 时兜底：同源同标题的已入架作品。"""
+    target_source = _text(source, 40)
+    target_title = _text(title, 200)
+    if not target_title:
+        return None
+    store = load_store()
+    for item in store["items"]:
+        if item.get("title") != target_title:
+            continue
+        if target_source and item.get("source") != target_source:
+            continue
+        return dict(item)
+    return None
+
+
+def offline_detail(uid: str) -> dict[str, Any] | None:
+    """书架快照拼出的详情页数据；源不可用或进程重启后靠它兜底。"""
+    item = find_item_any_shelf(uid)
+    if item is None:
+        return None
+    chapters = [dict(entry) for entry in item.get("chapters") or [] if isinstance(entry, dict)]
+    summary = dict(item.get("summary") or {})
+    series = {
+        "uid": item.get("uid", ""),
+        "title": item.get("title", ""),
+        "author": item.get("author", "") or summary.get("author", ""),
+        "cover": item.get("cover", "") or summary.get("cover", ""),
+        "coverUrl": item.get("cover", ""),
+        "description": summary.get("description", ""),
+        "tags": _tags_of(item.get("tags")),
+        "status": summary.get("status", ""),
+        "url": item.get("url", ""),
+        "nsfw": _bool(item.get("nsfw")),
+        "providerName": item.get("providerName", ""),
+        "source": item.get("source", ""),
+        "key": item.get("key", ""),
+    }
+    if not chapters and not summary:
+        return None
+    return {"series": series, "chapters": chapters, "cached": False, "offline": True}
+
+
+def refresh_all(uid: str, series: dict[str, Any], chapters: Any = None, summary: Any = None) -> int:
+    """把一个作品在所有书架里的快照都刷新一遍，返回更新条数。"""
+    target = _text(uid, 200)
+    if not target:
+        return 0
+    updated = 0
+    with _LOCK:
+        store = load_store()
+        changed = False
+        for item in store["items"]:
+            if item.get("uid") != target:
+                continue
+            if _refresh_snapshot(item, series, chapters, summary):
+                updated += 1
+                changed = True
+        if changed:
+            _write_store(store)
+    return updated
+
+
+def auto_add_recent(record: dict[str, Any], chapters: Any = None, summary: Any = None) -> dict[str, Any] | None:
+    """阅读过的作品自动进默认书架（已在该架就只补快照）。"""
+    data = record if isinstance(record, dict) else {}
+    uid = _text(data.get("uid"), 200)
+    if not uid:
+        return None
+    with _LOCK:
+        store = load_store()
+        shelf = _find_shelf(store, DEFAULT_SHELF_ID)
+        if shelf is None:
+            shelf = next((s for s in store["shelves"] if s.get("kind") == "local"), None)
+        if shelf is None:
+            return None
+        existing = _find_item(store, shelf["id"], uid)
+        if existing is not None:
+            if _refresh_snapshot(existing, data, chapters, summary):
+                _write_store(store)
+            return dict(existing)
+        item = _new_item(shelf["id"], data, remote="", chapters=chapters, summary=summary)
+        item["uid"] = uid
+        item["seq"] = max((_int(row.get("seq")) for row in store["items"]), default=0) + 1
         store["items"].append(item)
         shelf["updated"] = _now()
         _write_store(store)
@@ -766,9 +1216,15 @@ def history_add(record: dict[str, Any]) -> dict[str, Any]:
         )
         store["history"] = [item for item in store["history"] if item.get("uid") != uid]
         store["history"].insert(0, entry)
-        del store["history"][MAX_HISTORY:]
+        del store["history"][_history_limit():]
         _write_store(store)
-        return dict(entry)
+    # 看过的作品自动进书架：重启/断网后历史里点进去仍然有章节可看
+    try:
+        if find_item_any_shelf(uid) is None:
+            auto_add_recent(data, data.get("chapters"), data.get("summary"))
+    except ShelfError:
+        log.warning("自动入架失败：%s", uid)
+    return dict(entry)
 
 
 def history_list(limit: int = 100) -> list[dict[str, Any]]:
@@ -784,7 +1240,7 @@ def history_list(limit: int = 100) -> list[dict[str, Any]]:
         count = 100
     if count <= 0:
         count = len(rows)
-    return rows[: min(count, MAX_HISTORY)]
+    return rows[: min(count, _history_limit())]
 
 
 def history_count() -> int:

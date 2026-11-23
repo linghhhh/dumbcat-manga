@@ -40,7 +40,7 @@ export async function render(root, params, ctx = {}) {
       row('📚', '我的书架', '多个书架、图源收藏、自建书架', () => navigate('#/shelf')),
       row('🕘', '浏览历史', '看过的章节，接着上次的地方看', () => navigate('#/shelf?tab=history')),
       row('🔗', '图源管理', '打开/关闭、导入图源，管理登录账号', () => navigate('#/sources')),
-      row('⬇️', '下载', '下载目录、每章图片数、同时下载几张', () => navigate('#/download-settings')),
+      row('⬇️', '下载缓存', '下载队列、历史，可自己选保存文件夹', () => navigate('#/shelf?tab=downloads')),
       row('🧹', '清空图片缓存', '不会删已下载的漫画', async () => {
         const ok = await confirmDialog('清空图片缓存？', '下次看会重新下载，不会删已下载的漫画。', { danger: true, okText: '清空' });
         if (!ok) return;

@@ -440,6 +440,7 @@ class Downloader:
             number_text = chapter_number_text(chapter)
             chapter_states[index] = {
                 "index": index,
+                "uid": str(chapter.get("uid") or ""),
                 "label": f"第 {number_text} 章",
                 "title": str(chapter.get("title") or ""),
                 "state": "pending",   # pending|fetching|queued|running|done|partial|failed|skipped|locked|empty|cancelled

@@ -76,13 +76,14 @@ export const api = {
   series: (uid) => request(`/api/series/${uid}`, { timeout: 150000 }),
   refreshChapters: (uid) => request(`/api/series/${uid}/refresh`, { method: 'POST', timeout: 180000 }),
   chapter: (chapterUid) => request(`/api/read/${chapterUid}`, { timeout: 180000 }),
-  download: ({ seriesUid, chapterUids, outputDir = '', workers }) =>
+  download: ({ seriesUid, chapterUids, outputDir = '', workers, series, chapters }) =>
     request('/api/download', {
       method: 'POST',
-      body: { seriesUid, chapterUids, outputDir, workers },
+      body: { seriesUid, chapterUids, outputDir, workers, series: series || {}, chapters: chapters || [] },
     }),
   downloads: () => request('/api/downloads'),
   cancelDownload: (id) => request(`/api/downloads/${id}/cancel`, { method: 'POST' }),
+  retryDownload: (id) => request(`/api/downloads/${id}/retry`, { method: 'POST' }),
   clearDownloads: () => request('/api/downloads/clear', { method: 'POST' }),
   plugins: () => request('/api/plugins'),
   /* 图源登录（Cookie）：浏览器抓取 or 账号密码（部分源支持） */
@@ -117,7 +118,14 @@ export const api = {
   deletePlugin: (key) => request(`/api/plugins/${encodeURIComponent(key)}`, { method: 'DELETE' }),
   copyPlugin: (key) => request(`/api/plugins/${encodeURIComponent(key)}/copy`, { method: 'POST' }),
   chooseFolder: (path = '') => request('/api/choose-folder', { method: 'POST', body: { path }, timeout: 300000 }),
+  // 安卓端「选择文件夹」用：列某个目录下的子目录，path 空 = 推荐默认目录
+  fsDirs: (path = '') => request(`/api/fs/dirs?path=${encodeURIComponent(path)}`, { timeout: 30000 }),
+  // 安卓端存储授权状态：{granted, need, can_ask}，403 时用来提示去哪儿开
+  storagePermission: () => request('/api/storage/permission', { timeout: 15000 }),
+  // 拉起系统授权页（安卓）；老后端没有就是 404/501
+  requestStorageAccess: () => request('/api/storage/permission', { method: 'POST', timeout: 120000 }),
   openFolder: (path) => request('/api/open-folder', { method: 'POST', body: { path } }),
+  exportDownloads: (path = '') => request('/api/export', { method: 'POST', body: { path }, timeout: 600000 }),
   cacheStats: () => request('/api/cache/stats'),
   clearCache: () => request('/api/cache/clear', { method: 'POST' }),
   history: () => request('/api/history'),
@@ -131,6 +139,10 @@ export const api = {
   shelfItems: (shelfId = '') => request(`/api/shelf/items${shelfId ? `?shelfId=${encodeURIComponent(shelfId)}` : ''}`),
   shelfAdd: (payload) => request('/api/shelf/add', { method: 'POST', body: payload, timeout: 60000 }),
   shelfRemove: (shelfId, uid) => request('/api/shelf/remove', { method: 'POST', body: { shelfId, uid }, timeout: 60000 }),
+  shelfBulk: ({ shelfId, uids, action, targetShelfId = '' }) =>
+    request('/api/shelf/bulk', { method: 'POST', body: { shelfId, uids, action, targetShelfId }, timeout: 60000 }),
+  shelfPin: ({ shelfId, uid, pinned = true }) =>
+    request('/api/shelf/pin', { method: 'POST', body: { shelfId, uid, pinned }, timeout: 60000 }),
   sourceFavorites: (key, pages = 0) =>
     request(`/api/sources/${encodeURIComponent(key)}/favorites?pages=${pages}`, { timeout: 240000 }),
   shelfSync: (source, pages = 0) =>
@@ -140,6 +152,10 @@ export const api = {
   shelfHistoryAdd: (payload) => request('/api/shelf/history', { method: 'POST', body: payload }),
   shelfHistoryClear: () => request('/api/shelf/history/clear', { method: 'POST' }),
   shelfHistoryRemove: (uid) => request('/api/shelf/history/remove', { method: 'POST', body: { uid } }),
+  /* 阅读进度存在服务端 SQLite，清缓存 / 换壳之后还能接着看 */
+  progress: (seriesUid) => request(`/api/progress/${encodeURIComponent(seriesUid || '')}`),
+  saveProgress: (payload) => request('/api/progress', { method: 'POST', body: payload }),
+  clearProgress: (seriesUid) => request('/api/progress/clear', { method: 'POST', body: { seriesUid } }),
 };
 
 /* ------------------------------ SSE：全局事件 ------------------------------ */

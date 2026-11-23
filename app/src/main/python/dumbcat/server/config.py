@@ -41,6 +41,13 @@ WEB_RUNTIME = RUNTIME_ROOT / "web"
 IMAGE_CACHE_DIR = WEB_RUNTIME / "images"
 PLUGIN_CACHE_DIR = WEB_RUNTIME / "plugin-cache"
 LOG_DIR = WEB_RUNTIME / "logs"
+#: 章节图片列表的落盘缓存：进程重启后仍能离线打开看过的章节
+#: （P1 起首页数据进 SQLite，这个目录只用于读旧版本的遗留文件并迁移）
+PAGES_CACHE_DIR = WEB_RUNTIME / "pages"
+
+#: 长期数据（作品 / 章节 / 图片列表 / 书架 / 进度 / 下载任务）的 SQLite 库。
+#: 用环境变量 ``DUMBCAT_DB`` 可以在测试里指向临时文件。
+DB_PATH = Path(os.getenv("DUMBCAT_DB") or (APP_CONFIG_DIR / "dumbcat.db"))
 
 
 @dataclass
@@ -63,6 +70,10 @@ class Settings:
     reduce_motion: bool = False
     #: 封面网格最小宽度（px），越大每行越少
     grid_min_width: int = 168
+    #: 阅读器里每张图之间的空隙（px），0 表示无缝拼起来
+    reader_gap: int = 0
+    #: 浏览历史最多留多少条（旧的自动丢）
+    history_limit: int = 500
     #: 滚动到底自动加载下一页（关闭后显示「加载更多」按钮）
     auto_load_more: bool = True
     #: 章节列表默认倒序（新章节在前）
@@ -109,6 +120,10 @@ def _coerce(raw: dict[str, Any], base: Settings) -> Settings:
             data[item.name] = _clamp(value, 1, 16, data[item.name])
         elif item.name == "grid_min_width":
             data[item.name] = _clamp(value, 110, 320, data[item.name])
+        elif item.name == "reader_gap":
+            data[item.name] = _clamp(value, 0, 40, data[item.name])
+        elif item.name == "history_limit":
+            data[item.name] = _clamp(value, 100, 3000, data[item.name])
         elif item.name == "image_cache_mb":
             data[item.name] = _clamp(value, 0, 65536, data[item.name])
         elif item.name == "search_concurrency":
@@ -190,7 +205,7 @@ def update_settings(patch: dict[str, Any]) -> Settings:
 
 
 def ensure_dirs() -> None:
-    for path in (WEB_RUNTIME, IMAGE_CACHE_DIR, PLUGIN_CACHE_DIR, LOG_DIR, USER_PLUGIN_DIR):
+    for path in (WEB_RUNTIME, IMAGE_CACHE_DIR, PLUGIN_CACHE_DIR, LOG_DIR, PAGES_CACHE_DIR, USER_PLUGIN_DIR):
         try:
             path.mkdir(parents=True, exist_ok=True)
         except OSError:
