@@ -33,8 +33,23 @@ JSON_SOURCE_DIR = Path(os.getenv("DUMBCAT_JSON_DIR") or (Path(__file__).resolve(
 META_KEYS = ("key", "name", "icon", "nsfw", "note", "status", "order", "homepage")
 
 
-def load_specs(dirs: Iterable[Path | str] | None = None) -> list[dict[str, Any]]:
-    """读出所有清单（不做实例化，失败的文件跳过并记日志）。"""
+def _is_enabled(key: str, cfg: dict[str, Any], overlay: dict[str, bool] | None) -> bool:
+    """清单里的 enabled 是出厂默认值；用户在界面上拨过的开关（overlay）优先。"""
+    if overlay and key in overlay:
+        return bool(overlay[key])
+    return cfg.get("enabled") is not False
+
+
+def load_specs(
+    dirs: Iterable[Path | str] | None = None,
+    include_disabled: bool = False,
+    enabled_overlay: dict[str, bool] | None = None,
+) -> list[dict[str, Any]]:
+    """读出所有清单（不做实例化，失败的文件跳过并记日志）。
+
+    ``include_disabled`` 为 False 时跳过 ``enabled: false`` 的图源；
+    图源管理页需要列出被关掉的条目，用 True 拿全量。
+    """
     roots = [Path(item) for item in (dirs or [JSON_SOURCE_DIR])]
     specs: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -58,9 +73,13 @@ def load_specs(dirs: Iterable[Path | str] | None = None) -> list[dict[str, Any]]
             if engine == "rules":
                 # 规则型由 registry 当插件加载，这里不重复处理
                 continue
+            enabled = _is_enabled(key, cfg, enabled_overlay)
+            if not include_disabled and not enabled:
+                continue
             spec = dict(cfg)
             spec["key"] = key
             spec["engine"] = engine or "python"
+            spec["enabled"] = enabled
             spec["path"] = str(path)
             seen.add(key)
             specs.append(spec)
@@ -95,13 +114,17 @@ def build_provider(spec: dict[str, Any]) -> SeriesProvider:
 def build_providers(
     dirs: Iterable[Path | str] | None = None,
     include_breeze: bool = True,
+    enabled_overlay: dict[str, bool] | None = None,
 ) -> dict[str, SeriesProvider]:
     """读出所有可用图源：key → provider。坏一条跳过，不影响其他。"""
     result: dict[str, SeriesProvider] = {}
-    for spec in load_specs(dirs):
-        if spec.get("enabled") is False:
+    for spec in load_specs(dirs, enabled_overlay=enabled_overlay):
+        if not spec.get("enabled", True):
             continue
-        if spec.get("breeze") and not include_breeze:
+        # 需要梯子/浏览器的站点默认不加载（include_breeze=False），但用户在
+        # 图源管理里明确打开过的，以用户的决定为准。
+        explicit_on = bool(enabled_overlay and enabled_overlay.get(spec["key"]))
+        if spec.get("breeze") and not include_breeze and not explicit_on:
             continue
         try:
             provider = build_provider(spec)

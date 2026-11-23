@@ -2277,7 +2277,10 @@ class CopyComicProvider(SeriesProvider):
         return COPYMANGA_SITE_BASE
 
 
-def build_providers(include_breeze: bool = False) -> dict[str, SeriesProvider]:
+def build_providers(
+    include_breeze: bool = False,
+    enabled_overlay: dict[str, bool] | None = None,
+) -> dict[str, SeriesProvider]:
     """构建漫源注册表：key → provider。
 
     图源现在由 ``dumbcat/sources/json/*.json`` 描述（一个图源一个文件），
@@ -2287,10 +2290,13 @@ def build_providers(include_breeze: bool = False) -> dict[str, SeriesProvider]:
     include_breeze 为 True 时额外接入「需要梯子 / 需要浏览器」的站点
     （拷贝漫画、WEBTOON、JJ漫画、漫画柜、包子漫画）。这些站点在部分网络
     环境下不可达，但加载 provider 本身不发请求，失败只在真正浏览时提示。
+
+    enabled_overlay 是用户在界面里拨过的开关（``config/sources-enabled.json``），
+    优先级高于清单里的 ``enabled``。
     """
     from dumbcat.sources.manifest import build_providers as _from_json
 
-    return _from_json(include_breeze=include_breeze)
+    return _from_json(include_breeze=include_breeze, enabled_overlay=enabled_overlay)
 
 
 

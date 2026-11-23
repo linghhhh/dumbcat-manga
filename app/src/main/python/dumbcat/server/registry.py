@@ -34,7 +34,9 @@ from dumbcat.server.config import (
     BUILTIN_PLUGIN_DIR,
     PLUGIN_CACHE_DIR,
     USER_PLUGIN_DIR,
+    load_enabled_overlay,
     load_settings,
+    save_enabled_overlay,
 )
 
 log = logging.getLogger("dumbcat.registry")
@@ -625,7 +627,10 @@ class Registry:
             from dumbcat.sources.providers import build_providers
 
             include_breeze = bool(load_settings().include_browser_sources)
-            providers = build_providers(include_breeze=include_breeze)
+            providers = build_providers(
+                include_breeze=include_breeze,
+                enabled_overlay=load_enabled_overlay(),
+            )
         except Exception as exc:  # noqa: BLE001 - 内置源全军覆没时仍要能跑插件
             self._last_error = f"内置漫源加载失败：{exc}"
             log.error(self._last_error)
@@ -649,6 +654,7 @@ class Registry:
         if not JSON_SOURCE_DIR.is_dir():
             return
         seen = set(self._adapters)
+        overlay = load_enabled_overlay()
         for path in sorted(JSON_SOURCE_DIR.glob("*.json")):
             try:
                 cfg = json.loads(path.read_text(encoding="utf-8"))
@@ -656,10 +662,43 @@ class Registry:
                 continue
             if not isinstance(cfg, dict) or str(cfg.get("engine") or "").lower() != "rules":
                 continue
+            _key, enabled = self._json_enabled(path, overlay)
+            if not enabled:
+                continue
             try:
                 self._load_json_source(path, seen)
             except Exception as exc:  # noqa: BLE001
                 log.error("规则图源 %s 加载失败：%s", path.name, exc)
+
+    @staticmethod
+    def _read_json_cfg(path: Path) -> dict[str, Any] | None:
+        try:
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - 坏文件当不存在
+            return None
+        return cfg if isinstance(cfg, dict) else None
+
+    @staticmethod
+    def _json_key(path: Path, cfg: dict[str, Any]) -> str:
+        fallback = re.sub(r"[^a-z0-9_]", "_", path.stem.lower()) or "broken"
+        if not PLUGIN_KEY_RE.match(fallback):
+            fallback = "p_" + hashlib.sha1(fallback.encode()).hexdigest()[:8]
+        declared = str(cfg.get("key") or "").strip().lower()
+        if declared and PLUGIN_KEY_RE.match(declared):
+            return declared
+        return fallback
+
+    def _json_enabled(
+        self, path: Path, overlay: dict[str, bool] | None = None
+    ) -> tuple[str, bool]:
+        """返回 ``(key, 是否启用)``；用户拨过的开关（overlay）优先于清单。"""
+        cfg = self._read_json_cfg(path)
+        if cfg is None:
+            return ("", True)
+        key = self._json_key(path, cfg)
+        if overlay and key in overlay:
+            return (key, bool(overlay[key]))
+        return (key, cfg.get("enabled") is not False)
 
     def _plugin_dirs(self) -> list[Path]:
         dirs = [self._user_dir]
@@ -782,6 +821,9 @@ class Registry:
 
     def _load_one(self, path: Path, seen: set[str]) -> LoadedPlugin | None:
         if path.is_file() and path.suffix.lower() == ".json":
+            _key, enabled = self._json_enabled(path, load_enabled_overlay())
+            if not enabled:
+                return None
             return self._load_json_source(path, seen)
         manifest = _manifest_for(path)
         entry = _entry_file(path, manifest)
@@ -902,11 +944,101 @@ class Registry:
         return adapter
 
     def sources(self) -> list[dict[str, Any]]:
+        """全部图源：已加载的 + 加载失败的 + 被关掉的（enabled=False）。
+
+        关掉的图源也要列出来，否则图源管理里一旦关闭就再也打不开了。
+        """
+        overlay = load_enabled_overlay()
         with self._lock:
             items = [adapter.info.public() for adapter in self._adapters.values()]
             items.extend(entry.info.public() for entry in self._failed.values())
+            seen = {item["key"] for item in items}
+            for info in self._disabled_infos(overlay):
+                if info.key in seen:
+                    continue
+                seen.add(info.key)
+                items.append(info.public())
         items.sort(key=lambda item: (item["kind"] != "builtin", item["name"].lower()))
         return items
+
+    def _disabled_infos(self, overlay: dict[str, bool]) -> list[SourceInfo]:
+        """被关掉的图源（内置清单 + 规则型 + 用户目录），只用于列表展示。"""
+        infos: dict[str, SourceInfo] = {}
+        try:
+            from dumbcat.sources.manifest import JSON_SOURCE_DIR, load_specs
+
+            for spec in load_specs(include_disabled=True, enabled_overlay=overlay):
+                if spec.get("enabled") is not False:
+                    continue
+                key = str(spec["key"])
+                infos[key] = SourceInfo(
+                    key=key,
+                    name=str(spec.get("name") or key),
+                    kind="builtin",
+                    icon=str(spec.get("icon") or "🐾"),
+                    nsfw=bool(spec.get("nsfw")),
+                    base_url=str(spec.get("homepage") or ""),
+                    origin=str(spec.get("path") or ""),
+                    enabled=False,
+                )
+            roots = [JSON_SOURCE_DIR]
+        except Exception:  # noqa: BLE001 - 清单读不出来不影响已加载的源
+            roots = []
+        roots.append(self._user_dir)
+        for root in roots:
+            try:
+                paths = sorted(root.glob("*.json")) if root.is_dir() else []
+            except OSError:
+                paths = []
+            for path in paths:
+                if path.name == "plugin.json":
+                    continue
+                raw = self._read_json_cfg(path)
+                if raw is None:
+                    continue
+                declared = str(raw.get("key") or "").strip().lower()
+                if declared and declared in infos:
+                    # 已在上面按清单列过了（python 型引擎），别重复
+                    continue
+                key, enabled = self._json_enabled(path, overlay)
+                if not key or enabled or key in infos:
+                    continue
+                cfg = raw
+                infos[key] = SourceInfo(
+                    key=key,
+                    name=str(cfg.get("name") or path.stem),
+                    kind="plugin" if root == self._user_dir else "builtin",
+                    icon=str(cfg.get("icon") or "🐾"),
+                    nsfw=bool(cfg.get("nsfw")),
+                    base_url=str(cfg.get("base_url") or ""),
+                    origin=str(path),
+                    enabled=False,
+                )
+        return list(infos.values())
+
+    def set_source_enabled(self, key: str, enabled: bool) -> dict[str, Any]:
+        """打开 / 关闭一个图源：写覆盖层，然后重载注册表。"""
+        name = str(key or "").strip().lower()
+        if not name:
+            raise SourceError("图源标识为空")
+        if name not in self._known_source_keys():
+            raise SourceError(f"图源不存在：{name}")
+        overlay = load_enabled_overlay()
+        overlay[name] = bool(enabled)
+        save_enabled_overlay(overlay)
+        self.reload_all()
+        return {"key": name, "enabled": bool(enabled), "stats": self.stats()}
+
+    def _known_source_keys(self) -> set[str]:
+        keys = {item["key"] for item in self.sources()}
+        keys.update(load_enabled_overlay())
+        try:
+            from dumbcat.sources.manifest import load_specs
+
+            keys.update(str(spec["key"]) for spec in load_specs(include_disabled=True))
+        except Exception:  # noqa: BLE001
+            pass
+        return keys
 
     def failed(self) -> list[dict[str, Any]]:
         with self._lock:

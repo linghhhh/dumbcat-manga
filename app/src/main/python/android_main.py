@@ -28,7 +28,7 @@ MARKER = ".appdata-version"
 #: 老版本升级时必须重解压，否则会继续跑旧 appdata（没有书架接口）。
 #: 11 → 12：内置图源全部改为默认停用（json 里的 enabled: false），
 #: 已安装的老版本升级后也必须重解压，否则还会加载旧的启用状态。
-APPDATA_VERSION = "12"
+APPDATA_VERSION = "13"
 
 
 def log(message: str) -> None:

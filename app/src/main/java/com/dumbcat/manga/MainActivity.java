@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Intent;
 import android.graphics.Color;
+import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -25,6 +26,8 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
+
+import java.io.InputStream;
 
 import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
@@ -54,8 +57,8 @@ public class MainActivity extends Activity {
 
         Window window = getWindow();
         // 和网页顶栏同色，系统栏不抢戏；图标用深色
-        window.setStatusBarColor(Color.parseColor("#FFF6E6"));
-        window.setNavigationBarColor(Color.parseColor("#FFF6E6"));
+        window.setStatusBarColor(Color.parseColor("#F7FAFF"));
+        window.setNavigationBarColor(Color.parseColor("#F7FAFF"));
         window.getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
 
@@ -78,25 +81,33 @@ public class MainActivity extends Activity {
 
     private void buildViews() {
         FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(Color.parseColor("#FFF6E6"));
+        root.setBackgroundColor(Color.parseColor("#F7FAFF"));
         // targetSdk 35 强制贴边显示，这里让根视图自己让出状态栏/导航栏/输入法
         root.setFitsSystemWindows(true);
 
         web = new WebView(this);
-        web.setBackgroundColor(Color.parseColor("#FFF6E6"));
+        web.setBackgroundColor(Color.parseColor("#F7FAFF"));
         root.addView(web, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         LinearLayout splashBox = new LinearLayout(this);
         splashBox.setOrientation(LinearLayout.VERTICAL);
         splashBox.setGravity(Gravity.CENTER);
-        splashBox.setBackgroundColor(Color.parseColor("#FFF6E6"));
+        splashBox.setBackgroundColor(Color.parseColor("#F7FAFF"));
 
+        // 启动图直接用网页端同一张 loading.webp（呆猫和 doro 一起看书），
+        // 原生启动页和网页启动页是同一张图，切换不跳。
         ImageView logo = new ImageView(this);
-        logo.setImageResource(R.mipmap.ic_launcher);
-        LinearLayout.LayoutParams logoParams =
-                new LinearLayout.LayoutParams(dp(96), dp(96));
-        logoParams.bottomMargin = dp(18);
+        try (InputStream in = getAssets().open("appdata/web/assets/loading.webp")) {
+            logo.setImageDrawable(Drawable.createFromStream(in, "loading.webp"));
+        } catch (Exception ignored) {
+            logo.setImageResource(R.mipmap.ic_launcher);
+        }
+        logo.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        logo.setAdjustViewBounds(true);
+        LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(
+                dp(240), ViewGroup.LayoutParams.WRAP_CONTENT);
+        logoParams.bottomMargin = dp(10);
         splashBox.addView(logo, logoParams);
 
         TextView title = new TextView(this);

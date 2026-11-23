@@ -1164,3 +1164,32 @@ body.reading .app-shell { grid-template-columns: 1fr; }
   .shelf-seg { width: 100%; }
   .shelf-seg-btn { flex: 1; justify-content: center; }
 }
+
+/* ------------------------------ 图源管理 ------------------------------ */
+.src-summary { display: flex; align-items: baseline; gap: 6px; font-size: 13px; color: var(--ink-soft); }
+.src-count strong { font-size: 20px; color: var(--orange-deep); margin-right: 2px; }
+.src-section-head { margin-top: 22px; }
+.src-section-head h2 { margin: 0 0 2px; font-size: 17px; }
+.src-section-head .hint { margin: 0 0 10px; }
+.src-card { transition: opacity .15s ease; }
+.src-card .desc { min-height: 0; }
+.src-card .detail-meta { margin-bottom: 0; }
+.src-card.off { opacity: .74; }
+.src-card .ops { align-items: center; margin-top: 10px; }
+.src-state { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--ink-soft); margin-right: 2px; }
+.src-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--line-strong); }
+.src-dot.on { background: var(--mint); box-shadow: 0 0 0 3px rgba(34, 181, 115, .16); }
+.src-switch {
+  position: relative; width: 42px; height: 24px; flex: 0 0 auto;
+  border: 1px solid var(--line-strong); border-radius: 999px;
+  background: var(--cream-2); cursor: pointer; padding: 0;
+  transition: background .16s ease, border-color .16s ease;
+}
+.src-switch .knob {
+  position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+  border-radius: 50%; background: #FFF; box-shadow: 0 1px 3px rgba(20, 30, 50, .22);
+  transition: transform .16s ease;
+}
+.src-switch.on { background: var(--mint); border-color: var(--mint); }
+.src-switch.on .knob { transform: translateX(18px); }
+.src-switch:disabled { opacity: .6; cursor: default; }

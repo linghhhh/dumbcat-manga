@@ -44,8 +44,8 @@ android {
         // 对外的首个公开版本用 0.1.0（见 README「版本说明」）。
         // versionCode 必须继续递增：内部 3.2.x 的 versionCode 是 5，
         // 退回 1 会让已安装的老用户无法升级安装。
-        versionCode 6
-        versionName "0.1.0"
+        versionCode 7
+        versionName "0.2.0"
 
         ndk {
             // 64 位真机 + 老 32 位设备 + 模拟器
