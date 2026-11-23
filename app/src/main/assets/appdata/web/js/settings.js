@@ -185,40 +185,19 @@ function browsePanel() {
 }
 
 function downloadPanel() {
-  const dirInput = el('input', { type: 'text', value: saved.output_dir || '' });
-  dirInput.addEventListener('change', () => commit({ output_dir: dirInput.value.trim() }));
-
-  const pick = async () => {
-    try {
-      const result = await api.chooseFolder(dirInput.value.trim());
-      if (result && result.path) {
-        dirInput.value = result.path;
-        commit({ output_dir: result.path });
-      }
-    } catch (error) {
-      toast('没选成目录', { type: 'error', detail: error.message });
-    }
-  };
-
-  return panel('下载', '默认下到这里；每次下载前也可以临时改。',
+  const android = Boolean(saved.android);
+  const dirLine = android
+    ? el('code', { class: 'chip', text: [saved.output_dir, saved.output_subdir].filter(Boolean).join('/') })
+    : el('span', { class: 'hint', text: saved.output_dir || '' });
+  return panel('下载', '目录、每章最多几张、同时下几张，都在「下载」页里改。',
     el('div', { class: 'field' },
-      el('label', { text: '下载目录' }),
-      el('div', { class: 'row' },
-        dirInput,
-        el('button', { class: 'btn small', type: 'button', on: { click: pick } }, '📁 选择目录'),
-        el('button', {
-          class: 'btn small ghost', type: 'button',
-          on: {
-            click: async () => {
-              try { await api.openFolder(dirInput.value.trim()); } catch (error) { toast(error.message, { type: 'error' }); }
-            },
-          },
-        }, '打开'),
-      ),
+      el('label', { text: '现在的保存位置' }),
+      dirLine,
     ),
-    numberField('下载线程数', 'workers', { min: 1, max: 32, hint: '一次下几张图；图床慢时 16–24 通常最快' }),
-    numberField('封面并发', 'image_workers', { min: 1, max: 12, hint: '同时加载几个封面' }),
-    switchField('下载完成后打开文件夹', 'open_after_download'),
+    el('button', {
+      class: 'btn', type: 'button',
+      on: { click: () => { location.hash = '#/download-settings'; } },
+    }, '⬇️ 打开下载设置'),
   );
 }
 

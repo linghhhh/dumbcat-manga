@@ -185,6 +185,8 @@ def start(files_dir: str, cache_dir: str, apk_path: str,
     os.environ["MANGA_RUNTIME_DIR"] = str(runtime)
     # 手机网络慢，首屏别在后台抢流量
     os.environ.setdefault("DUMBCAT_NO_WARMUP", "1")
+    # 让设置页知道自己在手机上：下载根目录不可改，只能改子目录
+    os.environ["DUMBCAT_ANDROID"] = "1"
 
     log(f"root={home} output={output}")
 

@@ -99,6 +99,8 @@ class Downloader:
         self.cancel_event = cancel_event
         # 随下载事件回传，供 GUI 丢弃“上一轮下载”的迟到结果。
         self.request_id = request_id
+        #: 每章最多下载多少张图（0 = 不限），由设置页传入。
+        self.max_images = 0
 
     @staticmethod
     def is_locked(chapter: dict[str, Any]) -> bool:
@@ -186,9 +188,22 @@ class Downloader:
             except (TypeError, ValueError):
                 number = index
             records.append((number, image_url))
-        if records:
-            return self._dedupe_page_records(records)
-        return self._page_records(chapter)
+        if not records:
+            records = self._page_records(chapter)
+        else:
+            records = self._dedupe_page_records(records)
+        limit = max(0, int(getattr(self, "max_images", 0) or 0))
+        if limit and len(records) > limit:
+            self.emit(
+                "log",
+                message=(
+                    f"第 {chapter_number_text(chapter)} 章共 {len(records)} 张，"
+                    f"按设置只下载前 {limit} 张。"
+                ),
+                level="warning",
+            )
+            records = records[:limit]
+        return records
 
     def _prepare_jobs(
         self,
@@ -335,6 +350,7 @@ class Downloader:
         chapters: list[dict[str, Any]],
         output_root: Path,
         workers: int = 4,
+        max_images: int = 0,
     ) -> None:
         """边取图边下载：图片地址一到就开工，不再等所有章节扫描完。
 
@@ -344,6 +360,7 @@ class Downloader:
         output_root.mkdir(parents=True, exist_ok=True)
         # 图床通常和站点分离，32 个并发还压得住，能明显拉满带宽。
         workers = max(1, min(int(workers), 32))
+        self.max_images = max(0, int(max_images or 0))
         self.emit("log", message=f"开始下载：{series.get('title') or series.get('slug')}")
         provider_key = str(series.get("_provider") or "")
         provider = self.providers.get(provider_key)

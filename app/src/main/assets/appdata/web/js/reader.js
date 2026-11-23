@@ -154,6 +154,7 @@ function draw() {
   container.append(topBar(), el('div', { class: 'reader-progress' }, el('i', { id: 'readerProgress' })));
   const pages = el('div', { class: 'reader-pages', id: 'readerPages', dataset: { mode: state.mode } });
   state.pages.forEach((page) => pages.append(pageEl(page)));
+  prefetch(state.pages.slice(1, 5));
   container.append(pages, pagerEl());
   root.append(container);
   container.classList.toggle('light', loadLocal('reader.light', false) === true);
@@ -228,21 +229,44 @@ function topBar() {
   );
 }
 
+/* 先悄悄拉前几张，翻到那里就是秒开：浏览器缓存命中，图片元素直接复用。 */
+function prefetch(pages) {
+  pages.forEach((page) => {
+    const img = new Image();
+    img.decoding = 'async';
+    img.src = withToken(page.url);
+  });
+}
+
 function pageEl(page) {
   const img = el('img', {
     alt: `第 ${page.index + 1} 页`,
     loading: page.index < 3 ? 'eager' : 'lazy',
     decoding: 'async',
     draggable: 'false',
-    dataset: { index: String(page.index) },
+    dataset: { index: String(page.index), attempt: '0' },
   });
-  img.src = withToken(page.url);
-  img.addEventListener('load', () => img.classList.add('loaded'));
+  img.addEventListener('load', () => {
+    img.classList.remove('retrying');
+    img.classList.add('loaded');
+  });
   img.addEventListener('error', () => {
+    /* 图床偶尔抽风，先自己重试两次，别急着让用户看到裂图。 */
+    const attempt = Number(img.dataset.attempt || 0);
+    if (attempt < 2) {
+      img.dataset.attempt = String(attempt + 1);
+      img.classList.add('retrying');
+      setTimeout(() => {
+        img.src = withToken(page.url) + `&retry=${attempt + 1}`;
+      }, 700 * (attempt + 1));
+      return;
+    }
+    img.classList.remove('retrying');
     img.classList.add('failed');
     img.alt = `第 ${page.index + 1} 页加载失败，点一下重试`;
     img.style.minHeight = '120px';
   });
+  img.src = withToken(page.url);
   img.addEventListener('dblclick', () => {
     if (state.mode === 'single') return;
     const index = Number(img.dataset.index);
@@ -252,6 +276,8 @@ function pageEl(page) {
   img.addEventListener('click', () => {
     if (state.mode === 'single' || img.classList.contains('failed')) {
       img.classList.remove('failed');
+      img.dataset.attempt = '0';
+      img.style.minHeight = '';
       img.src = withToken(page.url);
     }
   });

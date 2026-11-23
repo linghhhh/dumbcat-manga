@@ -202,6 +202,28 @@ function sourceCard(item, on) {
       class: 'btn tiny', type: 'button',
       on: { click: () => openLogin(login) },
     }, login.loggedIn ? '账号已登录' : '登录账号'));
+    if (login.loggedIn) {
+      ops.append(el('button', {
+        class: 'btn tiny ghost', type: 'button',
+        on: { click: () => navigate(`#/favorites?source=${encodeURIComponent(item.key)}`) },
+      }, '查看收藏'));
+      ops.append(el('button', {
+        class: 'btn tiny ghost', type: 'button',
+        on: {
+          click: async () => {
+            const ok = await confirmDialog('退出登录？', `退出「${login.name || item.name || item.key}」后，这里就读不到它的收藏了。`, { danger: true, okText: '退出' });
+            if (!ok) return;
+            try {
+              await api.logoutSource(item.key);
+              toast('已退出登录', { type: 'ok' });
+              await refresh();
+            } catch (error) {
+              toast('退出失败', { type: 'error', detail: error.message });
+            }
+          },
+        },
+      }, '退出登录'));
+    }
   }
 
   if (item.kind === 'plugin') {
