@@ -64,7 +64,35 @@ LIST_KINDS: tuple[tuple[str, str], ...] = (
 )
 DEFAULT_LIST = "popular"
 
+# 类型页兜底表：`genreList.json` 拉不到时仍能翻页（slug 由 code 小写转换）。
+FALLBACK_GENRES: tuple[tuple[str, str], ...] = (
+    ("ROMANCE", "愛情"),
+    ("FANTASY", "奇幻冒險"),
+    ("SCHOOL", "校園"),
+    ("ADAPTATION", "影視化"),
+    ("WESTERN_PALACE", "古風"),
+    ("LOCAL", "在地"),
+    ("MARTIAL_ARTS", "武俠"),
+    ("BL_GL", "BL/GL"),
+    ("ROMANCE_M", "成人"),
+    ("DRAMA", "劇情"),
+    ("ACTION", "動作"),
+    ("THRILLER", "驚悚"),
+    ("HORROR", "恐怖"),
+    ("SLICE_OF_LIFE", "日常"),
+    ("COMEDY", "搞笑"),
+    ("TIME_SLIP", "穿越"),
+    ("CITY_OFFICE", "職場"),
+    ("MYSTERY", "推理"),
+    ("HEARTWARMING", "療癒"),
+    ("HISTORICAL", "歷史"),
+    ("SUPERHERO", "超級英雄"),
+    ("SPORTS", "運動"),
+)
+
 PAGE_SIZE = 30
+# 类型页一次能给出上千部，一页全塞进列表会把手机拖垮；先给前 300 部。
+GENRE_PAGE_CAP = 300
 
 
 def _force_tls12(client: Any) -> None:
@@ -207,6 +235,13 @@ class WebtoonProvider(SeriesProvider):
                 title = image.attr("alt").strip()
                 cover = WebtoonProvider.abs_image_url(image.attr("src"))
             if not title:
+                # 类型页的卡片没有 alt，标题在 strong.title / .title 里
+                for selector in ("strong.title", ".title", "span.subject"):
+                    node = query_one(anchor, selector)
+                    if node is not None and node.text_content().strip():
+                        title = node.text_content().strip()
+                        break
+            if not title:
                 title = anchor.attr("data-title-no")
             items.append(
                 {
@@ -232,10 +267,61 @@ class WebtoonProvider(SeriesProvider):
     ) -> PageResult:
         page = max(1, int(page or 1))
         self._apply_category(category)
-        if page > 1:
-            # 网页版榜单没有分页（带 ?page= 返回同一页），如实报告到底
+        feeds = self._browse_feeds()
+        index = page - 1
+        if index >= len(feeds):
             return PageResult(items=[], page=page, has_more=False, category=category)
-        url = f"{WEB_BASE}/{self._lang}/{self._list_kind}"
+        kind, value = feeds[index]
+        if kind == "rank":
+            items = self._ranking_cards(value, cancel_event)
+            note = f"{dict(LANGUAGES).get(self._lang, self._lang)} · 榜单 {dict(LIST_KINDS).get(value, value)}"
+        else:
+            items = self._genre_cards(value, cancel_event)
+            note = f"{dict(LANGUAGES).get(self._lang, self._lang)} · 类型 {value}"
+            if len(items) > GENRE_PAGE_CAP:
+                note += f"（共 {len(items)} 部，先显示前 {GENRE_PAGE_CAP} 部）"
+                items = items[:GENRE_PAGE_CAP]
+        return PageResult(
+            items=[self.decorate_series(item) for item in items],
+            page=page,
+            has_more=index + 1 < len(feeds),
+            total=len(items) or None,
+            category=category,
+            note=note,
+        )
+
+    def _browse_feeds(self) -> list[tuple[str, str]]:
+        """发现页的无限流：先三个榜单（当前榜优先），再逐个类型页。
+
+        网页版榜单本身只有 30 条、没有第二页；但 `/{lang}/genres/{slug}`
+        一次给出整个类型的作品（实测奇幻 483 部），拼起来足够刷很久。
+        """
+        kinds = [token for token, _label in LIST_KINDS]
+        ordered = [self._list_kind] + [kind for kind in kinds if kind != self._list_kind]
+        feeds: list[tuple[str, str]] = [("rank", kind) for kind in ordered]
+        feeds.extend(("genre", code) for code in self._genre_codes())
+        return feeds
+
+    def _genre_codes(self) -> list[str]:
+        cached = getattr(self, "_genre_codes_cache", None)
+        if cached:
+            return cached
+        codes: list[str] = []
+        try:
+            data = self._api(f"genreList.json?{self._common_qs()}")
+            genres = (data.get("genreList") or {}).get("genres") or []
+            for item in genres:
+                code = str((item or {}).get("code") or "").strip().upper()
+                if code and code not in codes:
+                    codes.append(code)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("dumbcat.webtoon").info("webtoon 类型表拉取失败：%s", exc)
+        if not codes:
+            codes = [code for code, _label in FALLBACK_GENRES]
+        self._genre_codes_cache = codes
+        return codes
+
+    def _web_html(self, url: str, cancel_event: threading.Event | None) -> tuple[str, str]:
         text, final_url = self.api.request_text(
             url,
             headers={
@@ -247,21 +333,36 @@ class WebtoonProvider(SeriesProvider):
             },
             cancel_event=cancel_event,
         )
+        return text, final_url
+
+    def _ranking_cards(
+        self, kind: str, cancel_event: threading.Event | None
+    ) -> list[dict[str, Any]]:
+        url = f"{WEB_BASE}/{self._lang}/ranking/{kind}"
+        text, final_url = self._web_html(url, cancel_event)
         root = HtmlTreeParser.parse(text)
-        items = [self.decorate_series(item) for item in self._cards_from(root)]
+        items = self._cards_from(root)
         logging.getLogger("dumbcat.webtoon").warning(
-            "webtoon 列表 %s -> %s 字节, %s 张卡片 :: %s",
-            final_url, len(text or ""), len(items), (text or "")[:300].replace(chr(10), " ")
+            "webtoon 榜单 %s -> %s 字节, %s 张卡片", final_url, len(text or ""), len(items)
         )
-        return PageResult(
-            items=items,
-            page=page,
-            has_more=False,
-            total=len(items) or None,
-            category=category,
-            note=f"{dict(LANGUAGES).get(self._lang, self._lang)} · "
-            f"{dict(LIST_KINDS).get(self._list_kind, self._list_kind)}",
+        return items
+
+    def _genre_cards(
+        self, code: str, cancel_event: threading.Event | None
+    ) -> list[dict[str, Any]]:
+        slug = code.lower().replace("_", "-")
+        url = f"{WEB_BASE}/{self._lang}/genres/{slug}"
+        try:
+            text, final_url = self._web_html(url, cancel_event)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("dumbcat.webtoon").warning("webtoon 类型 %s 抓取失败：%s", code, exc)
+            return []
+        root = HtmlTreeParser.parse(text)
+        items = self._cards_from(root)
+        logging.getLogger("dumbcat.webtoon").info(
+            "webtoon 类型 %s -> %s 字节, %s 张卡片", final_url, len(text or ""), len(items)
         )
+        return items
 
     def browse_series(
         self,

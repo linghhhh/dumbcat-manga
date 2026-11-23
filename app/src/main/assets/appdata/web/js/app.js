@@ -7,9 +7,11 @@ import * as search from './search.js';
 import * as detail from './detail.js';
 import * as reader from './reader.js';
 import * as downloads from './downloads.js';
+import * as downloadSettings from './download-settings.js';
 import * as shelf from './shelf.js';
 import * as plugins from './plugins.js';
 import * as sourcesPage from './sources.js';
+import * as favorites from './favorites.js';
 import * as settings from './settings.js';
 import * as mine from './mine.js';
 
@@ -19,9 +21,11 @@ const ROUTES = [
   { name: 'series', pattern: /^\/?series\/(.+)$/, mod: detail, title: '作品' },
   { name: 'read', pattern: /^\/?read\/(.+)$/, mod: reader, title: '阅读' },
   { name: 'downloads', pattern: /^\/?downloads\/?$/, mod: downloads, title: '下载' },
+  { name: 'download-settings', pattern: /^\/?download-settings\/?$/, mod: downloadSettings, title: '下载设置' },
   { name: 'shelf', pattern: /^\/?shelf\/?$/, mod: shelf, title: '书架' },
   { name: 'plugins', pattern: /^\/?plugins\/?$/, mod: plugins, title: '图源插件' },
   { name: 'sources', pattern: /^\/?sources\/?$/, mod: sourcesPage, title: '图源管理' },
+  { name: 'favorites', pattern: /^\/?favorites\/?$/, mod: favorites, title: '图源收藏' },
   { name: 'settings', pattern: /^\/?settings\/?$/, mod: settings, title: '设置' },
   { name: 'mine', pattern: /^\/?mine\/?$/, mod: mine, title: '我的' },
 ];

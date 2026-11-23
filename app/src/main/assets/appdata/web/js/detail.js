@@ -10,6 +10,8 @@ import { navigate } from './util.js';
 let state = null;
 let rootRef = null;
 let unmountHook = null;
+/* 章节列表一次全渲染：几百话的作品也不用再点「再显示 300 章」。 */
+const ALL_CHAPTERS = 100000;
 
 export async function render(root, params, ctx = {}) {
   const uid = params.uid;
@@ -45,7 +47,7 @@ export async function render(root, params, ctx = {}) {
     chapters: data.chapters || [],
     selected: new Set(),
     filter: '',
-    rendered: 240,
+    rendered: ALL_CHAPTERS,
     lastIndex: null,
     allSelected: false,
     pickMode: false,
@@ -276,7 +278,7 @@ function toolbarEl() {
   });
   filterInput.addEventListener('input', () => {
     state.filter = filterInput.value.trim().toLowerCase();
-    state.rendered = 240;
+    state.rendered = ALL_CHAPTERS;
     renderList();
   });
 
@@ -577,7 +579,7 @@ async function refreshChapters(button) {
   try {
     const data = await api.refreshChapters(state.uid);
     state.chapters = data.chapters || [];
-    state.rendered = 240;
+    state.rendered = ALL_CHAPTERS;
     state.selected = new Set();
     state.allSelected = false;
     draw();

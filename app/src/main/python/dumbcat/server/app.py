@@ -85,6 +85,8 @@ class DownloadRequest(BaseModel):
 
 class SettingsPatch(BaseModel):
     output_dir: str | None = None
+    output_subdir: str | None = None
+    max_images_per_chapter: int | None = None
     workers: int | None = None
     image_workers: int | None = None
     theme: str | None = None
@@ -245,6 +247,8 @@ async def get_settings() -> dict[str, Any]:
     data["pluginDir"] = str(registry.plugin_dir())
     data["cacheBytes"] = image_cache.size_bytes()
     data["version"] = VERSION
+    #: 手机版把下载根目录锁在应用私有目录，界面上只允许改子目录
+    data["android"] = bool(os.getenv("DUMBCAT_ANDROID"))
     return data
 
 
@@ -1489,6 +1493,65 @@ async def shelf_remove(req: ShelfRemoveRequest) -> dict[str, Any]:
             provider.remove_favorite, _shelf_remote_series(uid, item)
         )
     return {"ok": True, "remote": remote}
+
+
+@app.get("/api/sources/{key}/favorites")
+async def source_favorites(key: str, pages: int = Query(0, ge=0, le=40)) -> dict[str, Any]:
+    """只读地列出某个图源的官方收藏，交给用户自己挑着加进书架。"""
+    adapter, provider = _shelf_provider(key)
+    if adapter is None or provider is None:
+        raise HTTPException(400, "图源不存在或未启用")
+    display_name = _shelf_display_name(adapter, provider, key)
+    if not _shelf_supports_favorites(provider):
+        raise HTTPException(400, f"{display_name}不支持官方收藏夹")
+    if not await asyncio.to_thread(_shelf_is_logged_in, provider):
+        raise HTTPException(400, f"还没登录{display_name}")
+
+    pages = int(pages or 0) or SHELF_SYNC_DEFAULT_PAGES
+    pages = max(1, min(pages, SHELF_SYNC_MAX_PAGES))
+    budget = max(SHELF_SYNC_TIMEOUT, 25.0 + pages * 3.6)
+
+    def work() -> list[dict[str, Any]]:
+        try:
+            rows = provider.favorite_series("", max_pages=pages)
+        except TypeError:
+            rows = provider.favorite_series("")
+        out: list[dict[str, Any]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                out.append(_store_series(adapter, row))
+            except Exception as exc:  # noqa: BLE001 - 单条坏数据跳过
+                log.warning("读取收藏项失败：%s", exc)
+        return out
+
+    try:
+        items = await asyncio.wait_for(asyncio.to_thread(work), timeout=budget)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(400, "读取收藏超时，请稍后重试") from exc
+    except FavoritesUnsupported as exc:
+        raise HTTPException(400, f"{display_name}不支持官方收藏夹") from exc
+    except LoginRequired as exc:
+        raise HTTPException(400, f"还没登录{display_name}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"读取收藏失败：{exc}") from exc
+
+    total_hint = 0
+    try:
+        hint = getattr(provider, "favorite_total_hint", None)
+        if callable(hint):
+            total_hint = int(hint() or 0)
+    except Exception:  # noqa: BLE001
+        total_hint = 0
+    return {
+        "source": key,
+        "name": display_name,
+        "items": items,
+        "pages": pages,
+        "remoteTotal": total_hint,
+        "truncated": bool(total_hint and total_hint > len(items)),
+    }
 
 
 @app.post("/api/shelf/sync")

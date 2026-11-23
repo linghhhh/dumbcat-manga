@@ -154,6 +154,8 @@ class TaskManager:
         record, chapters, provider_key, provider_name = self._resolve(series_uid, chapter_uids)
         settings = load_settings()
         out = Path(output_dir or settings.output_dir).expanduser()
+        if not output_dir and settings.output_subdir:
+            out = out / settings.output_subdir
         try:
             out.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -330,6 +332,7 @@ class TaskManager:
             chapters,
             output_root,
             workers=int(settings.workers),
+            max_images=int(settings.max_images_per_chapter or 0),
         )
         task.finished_at = time.time()
         if task.cancel_event.is_set():

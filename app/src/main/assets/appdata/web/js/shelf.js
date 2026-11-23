@@ -9,7 +9,6 @@ import {
 
 const ACTIVE_SHELF_KEY = 'shelf.active';
 /* 图源收藏动辄上千部，一次只同步最近几页；这里记住「还有多少没同步」 */
-const SYNC_TRUNC_KEY = 'shelf.synctrunc';
 
 let rootEl = null;
 let state = null;
@@ -25,9 +24,6 @@ function emptyStateData() {
     activeShelfId: '',
     loading: true,
     error: '',
-    syncKey: '',
-    autoKey: '',
-    syncTruncated: loadLocal(SYNC_TRUNC_KEY, {}) || {},
     alive: () => true,
   };
 }
@@ -82,28 +78,6 @@ async function reload() {
   state.loading = false;
   if (!state.alive()) return;
   draw();
-  autoSyncIfNeeded();
-}
-
-/* 图源账号已登录但收藏架是空的 / 太旧 → 后台自动同步一次。
-   需求：「用户如果登录自己的图源账号，自动获取图源的收藏」。 */
-async function autoSyncIfNeeded() {
-  if (state.mode !== 'shelf' || state.autoKey || state.syncKey) return;
-  const source = (state.data?.sources || []).find((item) => item.loggedIn && item.supportsFavorites);
-  if (!source) return;
-  const shelf = (state.data?.shelves || []).find((item) => item.kind === 'source' && item.source === source.key);
-  const stale = !shelf || !shelf.updated || (Date.now() / 1000 - shelf.updated > 3600);
-  if (!stale) return;
-  state.autoKey = source.key;
-  if (state.alive()) draw();
-  try {
-    await api.shelfSync(source.key);
-  } catch {
-    /* 自动同步失败不打扰用户，手动同步时再报错 */
-  }
-  state.autoKey = '';
-  if (!state.alive()) return;
-  await reload();
 }
 
 /* ------------------------------ 动作 ------------------------------ */
@@ -117,6 +91,8 @@ async function setMode(mode) {
   state.loading = false;
   if (state.alive()) draw();
 }
+
+/* ------------------------------ 动作 ------------------------------ */
 
 async function createShelf() {
   const name = await promptDialog('新建书架', {
@@ -207,123 +183,6 @@ async function removeItem(item) {
     toast(error.message || '移除失败', { type: 'error' });
   }
 }
-
-async function syncSource(source, pages = 0) {
-  if (!source || state.syncKey) return;
-  state.syncKey = source.key;
-  if (rootEl) draw();
-  try {
-    const res = await api.shelfSync(source.key, pages);
-    const bits = [];
-    if (res.total) bits.push(`共 ${res.total} 本`);
-    if (res.added) bits.push(`新增 ${res.added}`);
-    if (res.removed) bits.push(`移除 ${res.removed}`);
-    toast(`「${source.name}」收藏已同步${bits.length ? `：${bits.join('，')}` : ''}`, { type: 'ok' });
-    if (res.truncated) {
-      state.syncTruncated[source.key] = {
-        synced: res.total || 0,
-        remote: res.remoteTotal || 0,
-        pages: res.pages || pages || 5,
-      };
-    } else {
-      delete state.syncTruncated[source.key];
-    }
-    saveLocal(SYNC_TRUNC_KEY, state.syncTruncated);
-  } catch (error) {
-    toast(error.message || '同步失败', { type: 'error' });
-  }
-  state.syncKey = '';
-  if (state.alive()) await reload();
-}
-
-async function logoutSource(source) {
-  const ok = await confirmDialog('退出登录？', `退出「${source.name}」后，这个图源的收藏架不会再自动更新。已同步到本机的作品还在。`, {
-    danger: true, okText: '退出',
-  });
-  if (!ok) return;
-  try {
-    await api.logoutSource(source.key);
-    toast('已退出登录', { type: 'ok' });
-    await reload();
-  } catch (error) {
-    toast(error.message || '退出失败', { type: 'error' });
-  }
-}
-
-function openLogin(source) {
-  const account = el('input', {
-    type: 'text',
-    placeholder: '账号 / 邮箱',
-    style: 'width:100%',
-    attrs: { autocapitalize: 'off', autocomplete: 'username', spellcheck: 'false' },
-  });
-  const password = el('input', {
-    type: 'password',
-    placeholder: '密码',
-    style: 'width:100%',
-    attrs: { autocomplete: 'current-password' },
-  });
-  const hint = el('p', { class: 'hint', text: '账号只保存在这台手机上，不会打进安装包。' });
-  const submit = el('button', { class: 'btn primary', type: 'button' }, '登录');
-  let working = false;
-
-  const doLogin = async () => {
-    if (working) return;
-    const user = account.value.trim();
-    const pass = password.value;
-    if (!user || !pass) {
-      hint.textContent = '账号和密码都要填。';
-      return;
-    }
-    working = true;
-    submit.disabled = true;
-    hint.textContent = '正在登录…';
-    try {
-      await api.loginPassword(source.key, user, pass);
-      closeModal();
-      toast('登录成功，正在拉取收藏…', { type: 'ok' });
-      state.syncKey = source.key;
-      if (state.alive()) draw();
-      try {
-        const res = await api.shelfSync(source.key);
-        toast(`收藏已同步：共 ${res.total || 0} 本`, { type: 'ok' });
-      } catch (error) {
-        toast(`登录成功，收藏同步失败：${error.message || '网络问题'}`, { type: 'warn' });
-      }
-      state.syncKey = '';
-      await reload();
-    } catch (error) {
-      hint.textContent = error.message || '登录失败，检查账号密码再试。';
-      submit.disabled = false;
-    } finally {
-      working = false;
-    }
-  };
-
-  submit.addEventListener('click', doLogin);
-  const onKey = (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      doLogin();
-    }
-  };
-  account.addEventListener('keydown', onKey);
-  password.addEventListener('keydown', onKey);
-
-  openModal(el('div', { class: 'shelf-login' },
-    el('h2', { text: `登录${source.name}` }),
-    el('p', { class: 'hint', text: '登录后会把这个图源账号的收藏收进书架；在这里收藏的作品也会推回图源收藏夹。' }),
-    el('div', { class: 'field' }, el('label', { text: '账号' }), account),
-    el('div', { class: 'field' }, el('label', { text: '密码' }), password),
-    hint,
-    el('div', { class: 'modal-actions' },
-      el('button', { class: 'btn ghost', type: 'button', on: { click: () => closeModal() } }, '取消'),
-      submit,
-    ),
-  ), { className: 'modal-login', onClose: () => {} });
-  setTimeout(() => account.focus(), 60);
-}
-
 /* ------------------------------ 渲染 ------------------------------ */
 
 function headEl() {
@@ -344,53 +203,34 @@ function segmentEl() {
 }
 
 function accountsEl() {
-  const sources = state.data?.sources || [];
+  const sources = (state.data?.sources || []).filter((item) => item.supportsFavorites);
+  const logged = sources.filter((item) => item.loggedIn);
   const box = el('div', { class: 'shelf-accounts' });
-  if (!sources.length) {
-    box.append(el('p', { class: 'hint', text: '当前没有支持官方收藏的图源。收藏会只保存在本机书架里。' }));
+  if (!logged.length) {
+    box.append(
+      el('p', { class: 'hint', text: '在「图源管理」里登录图源账号，就能查看它的收藏，挑着加进书架。' }),
+      el('button', {
+        class: 'btn ghost small',
+        type: 'button',
+        on: { click: () => navigate('#/sources') },
+      }, '去图源管理'),
+    );
     return box;
   }
-  for (const source of sources) {
-    const syncing = state.syncKey === source.key || state.autoKey === source.key;
-    const trunc = (state.syncTruncated || {})[source.key];
-    const status = syncing
-      ? '正在同步收藏…'
-      : source.loggedIn
-        ? `已登录${source.username ? ` · ${source.username}` : ''}`
-        : '未登录 · 登录后自动拉取该图源收藏';
-    const actions = el('div', { class: 'shelf-acc-actions' });
-    if (source.loggedIn) {
-      actions.append(
-        el('button', {
-          class: 'btn ghost small',
-          type: 'button',
-          on: { click: () => syncSource(source) },
-        }, syncing ? '同步中…' : '同步收藏'),
-        el('button', { class: 'btn ghost small danger', type: 'button', on: { click: () => logoutSource(source) } }, '退出登录'),
-      );
-      if (trunc && trunc.remote > trunc.synced) {
-        actions.append(el('button', {
-          class: 'btn ghost small',
-          type: 'button',
-          on: { click: () => syncSource(source, Math.min(40, (trunc.pages || 5) + 10)) },
-        }, `继续同步（还有 ${trunc.remote - trunc.synced} 部）`));
-      }
-    } else {
-      actions.append(el('button', { class: 'btn primary small', type: 'button', on: { click: () => openLogin(source) } }, '登录'));
-    }
-    box.append(el('div', { class: `shelf-acc${source.loggedIn ? ' on' : ''}` },
+  for (const source of logged) {
+    box.append(el('div', { class: 'shelf-acc on' },
       el('div', { class: 'shelf-acc-main' },
         el('div', { class: 'shelf-acc-name' },
           el('span', { class: 'shelf-acc-dot' }),
           source.name,
-          source.supportsFavorites ? el('span', { class: 'shelf-acc-tag', text: '官方收藏' }) : null,
         ),
-        el('div', { class: 'shelf-acc-status', text: status }),
-        trunc && trunc.remote > trunc.synced
-          ? el('div', { class: 'shelf-acc-status', text: `已同步最近 ${trunc.synced} 部，图源共 ${trunc.remote} 部` })
-          : null,
+        el('div', { class: 'shelf-acc-status', text: `已登录${source.username ? ` · ${source.username}` : ''} · 收藏由你自己挑` }),
       ),
-      actions,
+      el('button', {
+        class: 'btn primary small',
+        type: 'button',
+        on: { click: () => navigate(`#/favorites?source=${encodeURIComponent(source.key)}`) },
+      }, '查看收藏'),
     ));
   }
   return box;
@@ -440,7 +280,7 @@ function gridEl() {
   }
 
   if (!state.items.length) {
-    wrap.append(emptyState('📚', '这个书架还是空的', '打开作品页点「收藏」就能放进来；登录图源账号后，收藏架会自动装满。',
+    wrap.append(emptyState('📚', '这个书架还是空的', '打开作品页点「收藏」就能放进来；想去图源账号的收藏里挑，去「图源管理」。',
       el('button', { class: 'btn ghost', type: 'button', on: { click: () => navigate('#/browse') } }, '去发现作品')));
     return wrap;
   }

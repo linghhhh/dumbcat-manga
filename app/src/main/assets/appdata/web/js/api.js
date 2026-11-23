@@ -131,6 +131,8 @@ export const api = {
   shelfItems: (shelfId = '') => request(`/api/shelf/items${shelfId ? `?shelfId=${encodeURIComponent(shelfId)}` : ''}`),
   shelfAdd: (payload) => request('/api/shelf/add', { method: 'POST', body: payload, timeout: 60000 }),
   shelfRemove: (shelfId, uid) => request('/api/shelf/remove', { method: 'POST', body: { shelfId, uid }, timeout: 60000 }),
+  sourceFavorites: (key, pages = 0) =>
+    request(`/api/sources/${encodeURIComponent(key)}/favorites?pages=${pages}`, { timeout: 240000 }),
   shelfSync: (source, pages = 0) =>
     request('/api/shelf/sync', { method: 'POST', body: { source, pages }, timeout: 240000 }),
   shelfStatus: (uid) => request(`/api/shelf/status?uid=${encodeURIComponent(uid)}`),

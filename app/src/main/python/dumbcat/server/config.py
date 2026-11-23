@@ -49,6 +49,10 @@ class Settings:
 
     #: 下载根目录（每个作品会在其下建子目录）
     output_dir: str = str(DEFAULT_OUTPUT)
+    #: 下载根目录下的子目录；留空表示直接用根目录
+    output_subdir: str = ""
+    #: 每章最多下载多少张图（0 表示不限）
+    max_images_per_chapter: int = 0
     #: 并发下载线程
     workers: int = 8
     #: 每章图片之间的并发
@@ -115,6 +119,13 @@ def _coerce(raw: dict[str, Any], base: Settings) -> Settings:
             text = str(value or "").strip()
             if text:
                 data[item.name] = text
+        elif item.name == "output_subdir":
+            #: 只接受相对路径，挡掉 .. 和绝对路径，避免跑到根目录外面
+            text = str(value or "").replace("\\", "/").strip().strip("/")
+            parts = [piece for piece in text.split("/") if piece not in ("", ".", "..")]
+            data[item.name] = "/".join(parts)[:80]
+        elif item.name == "max_images_per_chapter":
+            data[item.name] = _clamp(value, 0, 5000, data[item.name])
         elif item.name == "last_source":
             data[item.name] = str(value or "")
         elif item.name == "extra" and isinstance(value, dict):
