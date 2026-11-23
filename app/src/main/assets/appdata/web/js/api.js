@@ -60,6 +60,12 @@ export const api = {
   settings: () => request('/api/settings'),
   saveSettings: (patch) => request('/api/settings', { method: 'POST', body: patch }),
   sources: () => request('/api/sources'),
+  /* 图源开关：关掉的图源会留在列表里，可以再打开 */
+  setSourceEnabled: (key, enabled) => request(`/api/sources/${encodeURIComponent(key)}/enabled`, {
+    method: 'POST',
+    body: { enabled },
+    timeout: 180000,
+  }),
   reloadSources: () => request('/api/sources/reload', { method: 'POST', timeout: 180000 }),
   browse: ({ source, page = 1, category = '' }) =>
     request(`/api/browse?source=${encodeURIComponent(source)}&page=${page}&category=${encodeURIComponent(category)}`, { timeout: 150000 }),

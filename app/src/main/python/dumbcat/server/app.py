@@ -69,7 +69,7 @@ from dumbcat.server.tasks import tasks
 log = logging.getLogger("dumbcat.server")
 
 WEB_DIR = PROJECT_ROOT / "web"
-VERSION = "3.2.1"
+VERSION = "0.2.0"
 TOKEN = secrets.token_urlsafe(24)
 
 
@@ -104,6 +104,8 @@ class PluginSave(BaseModel):
     content: str
 
 
+class SourceToggle(BaseModel):
+    enabled: bool = True
 
 
 class PathRequest(BaseModel):
@@ -284,6 +286,17 @@ async def reload_sources() -> dict[str, Any]:
     clear_browse_cache()
     await asyncio.to_thread(registry.reload_all)
     return {"ok": True, "stats": registry.stats()}
+
+
+@app.post("/api/sources/{key}/enabled")
+async def set_source_enabled(key: str, req: SourceToggle) -> dict[str, Any]:
+    """图源管理页的开关：关掉的图源仍留在列表里，可以再打开。"""
+    try:
+        result = await asyncio.to_thread(registry.set_source_enabled, key, req.enabled)
+    except SourceError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    clear_browse_cache()
+    return {"ok": True, **result}
 
 
 # ---------- 官方账号登录（Cookie） ----------

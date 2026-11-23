@@ -19,6 +19,13 @@ from dumbcat.app_config import APP_CONFIG_DIR, CONFIG_PATH, DEFAULT_OUTPUT
 #: Web 版配置路径
 WEB_CONFIG_PATH = APP_CONFIG_DIR / "web.json"
 
+#: 图源开关的覆盖层：``{key: bool}``。
+#:
+#: 图源清单（appdata/json/*.json）里的 ``enabled`` 只是出厂默认值，而且升级时
+#: 会被重新解压覆盖。用户在图源管理里拨的开关单独存这里，加载图源时以这里的
+#: 值优先——这样关掉的内置图源仍然能被列出来重新打开，升级也不会丢开关。
+SOURCES_ENABLED_PATH = APP_CONFIG_DIR / "sources-enabled.json"
+
 #: 项目根目录（本文件在 dumbcat/server/ 下）
 PROJECT_ROOT = Path(os.getenv("DUMBCAT_ROOT") or Path(__file__).resolve().parent.parent.parent)
 
@@ -186,3 +193,31 @@ def output_root() -> Path:
     except OSError:
         pass
     return root
+
+
+def load_enabled_overlay() -> dict[str, bool]:
+    """读图源开关覆盖层；文件缺失或损坏都当作「没有任何覆盖」。"""
+    try:
+        raw = json.loads(SOURCES_ENABLED_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    overlay: dict[str, bool] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip().lower()
+        if name:
+            overlay[name] = bool(value)
+    return overlay
+
+
+def save_enabled_overlay(overlay: dict[str, bool]) -> dict[str, bool]:
+    """写回图源开关覆盖层；原子替换，避免半截文件。"""
+    clean = {str(k).strip().lower(): bool(v) for k, v in overlay.items() if str(k).strip()}
+    with _LOCK:
+        SOURCES_ENABLED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SOURCES_ENABLED_PATH.with_suffix(".tmp")
+        payload = json.dumps(clean, ensure_ascii=False, indent=2, sort_keys=True)
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, SOURCES_ENABLED_PATH)
+    return clean
